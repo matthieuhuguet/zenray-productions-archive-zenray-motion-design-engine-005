@@ -1,0 +1,251 @@
+# 12 October 2026, 18:20 CEST: measured feature record of a font file (F1 font dataset).
+# Every record is measured from rendered outlines (zrmd.vector.render) with the F0 metrics (zrmd.vector.metrics) on
+# a fixed specimen, so two fonts are compared as numbers and never by name. One record per font file, at its
+# regular location (wght clamped to settings vector.features.location_wght, other axes at default), plus the stem
+# width sampled across the wght axis so the matcher can invert a measured stem into a weight.
+# Defaults live in settings.json, section "vector.features" (HDA law).
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import numpy as np
+
+from zrmd import settings
+from zrmd.vector import metrics as M
+from zrmd.vector import render as R
+
+
+def _cfg() -> dict:
+    return settings.get("vector.features")
+
+
+def regular_axes(font_file: str, wght: float | None = None) -> dict:
+    """Axes of the regular location: wght at the requested value clamped to the axis, other axes at default."""
+    cfg = _cfg()
+    wght = cfg["location_wght"] if wght is None else wght
+    out = {}
+    for a in R.font_axes(font_file):
+        if a["tag"] == "wght":
+            out["wght"] = float(min(a["max"], max(a["min"], wght)))
+    return out
+
+
+def has_glyphs(font_file: str, text: str) -> list[str]:
+    """Characters of text the font cannot map (empty list when every character has a glyph)."""
+    face = R._face(str(font_file))
+    import uharfbuzz as hb
+    font = hb.Font(face)
+    return [ch for ch in dict.fromkeys(text) if not ch.isspace() and not font.get_nominal_glyph(ord(ch))]
+
+
+def _glyph_mask(ch: str, font_file: str, axes: dict, size: float) -> np.ndarray:
+    return R.render_text(ch, font_file, size, axes).mask
+
+
+def ray_aperture(mask: np.ndarray, centre: tuple[float, float], rays: int, threshold: float) -> float:
+    """Fraction of rays cast from centre (y, x) that leave the ink box without touching ink: the opening angle of
+    a c or the lower counter of an e, over 360 degrees (0 for an o, about 0.06 for a geometric c, 0.15 for a grotesque c, 0.3 for a
+    humanist one). 12 October 2026."""
+    box = M.ink_box(mask, threshold)
+    if box is None:
+        return 0.0
+    t, l, b, r = box
+    ink = mask >= threshold
+    cy, cx = centre
+    step = 0.5
+    escaped = 0
+    for k in range(rays):
+        a = 2 * math.pi * k / rays
+        dy, dx = -math.sin(a), math.cos(a)
+        y, x = cy, cx
+        hit = False
+        while t <= y <= b and l <= x <= r:
+            if ink[int(round(y)), int(round(x))]:
+                hit = True
+                break
+            y += dy * step
+            x += dx * step
+        escaped += not hit
+    return round(escaped / rays, 4)
+
+
+def holes(mask: np.ndarray, threshold: float) -> int:
+    """Number of enclosed counters (2 for a double-story g, 1 for an o)."""
+    import cv2
+    ink = (mask >= threshold).astype(np.uint8)
+    contours, hier = cv2.findContours(ink, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hier is None:
+        return 0
+    return int(sum(1 for h in hier[0] if h[3] >= 0))
+
+
+def o_shape(mask: np.ndarray, threshold: float, rays: int) -> dict:
+    """Shape of the o: outer aspect (width over height), counter aspect, and the stress. Thickness is measured
+    along rays from the counter centroid; stress_angle is the direction of the thickest stroke folded to
+    0..180 degrees (0 or 180 = thick vertical sides, upright stress; about 15 to 30 or 150 to 165 for an oblique
+    humanist stress),
+    stress_ratio = thickest over thinnest. 12 October 2026."""
+    import cv2
+    box = M.ink_box(mask, threshold)
+    if box is None:
+        return {}
+    t, l, b, r = box
+    ink = mask >= threshold
+    out = {"aspect": round((r - l + 1) / max(b - t + 1, 1), 4)}
+    filled = ink.copy()
+    contours, hier = cv2.findContours(ink.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    inner = [c for c, h in zip(contours, hier[0]) if h[3] >= 0] if hier is not None else []
+    if not inner:
+        return out
+    c = max(inner, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(c)
+    out["counter_aspect"] = round(w / max(h, 1), 4)
+    mom = cv2.moments(c)
+    cy, cx = mom["m01"] / max(mom["m00"], 1e-9), mom["m10"] / max(mom["m00"], 1e-9)
+    thick = []
+    for k in range(rays):
+        a = math.pi * k / rays
+        best = 0.0
+        for sgn in (1, -1):
+            dy, dx = -math.sin(a) * sgn, math.cos(a) * sgn
+            yy, xx, inside, run = cy, cx, False, 0.0
+            while 0 <= yy < filled.shape[0] - 1 and 0 <= xx < filled.shape[1] - 1:
+                v = filled[int(round(yy)), int(round(xx))]
+                if v:
+                    inside = True
+                    run += 0.5
+                elif inside:
+                    break
+                yy += dy * 0.5
+                xx += dx * 0.5
+            best += run
+        thick.append(best / 2)
+    thick = np.array(thick)
+    # The thickest stroke lies perpendicular to the stress axis direction it is measured along; report the ray
+    # direction of maximum thickness (0 = horizontal ray, i.e. thick vertical sides).
+    k = int(np.argmax(thick))
+    out["stress_angle"] = round(180.0 * k / rays, 2)
+    out["stress_ratio"] = round(float(thick.max() / max(thick.min(), 1e-6)), 4)
+    return out
+
+
+def advances_em(font_file: str, axes: dict, chars: str) -> dict:
+    """Advance width of each character in em (HarfBuzz, no kerning context)."""
+    out = {}
+    for ch in chars:
+        o = R.shape_text(ch, font_file, 1000.0, axes, kerning=False)
+        out[ch] = round(o.glyphs[0]["advance"] / 1000.0, 5) if o.glyphs else None
+    return out
+
+
+def stem_curve(font_file: str, cfg: dict) -> list[list[float]]:
+    """Stem width (stroke p50 over size) of the specimen at sampled wght values: [[wght, stem_em], ...].
+    A static font returns its single point at its OS/2 weight class."""
+    wght_axis = next((a for a in R.font_axes(font_file) if a["tag"] == "wght"), None)
+    size = cfg["specimen_px"]
+    if wght_axis is None:
+        m = R.render_text(cfg["specimen"], font_file, size).mask
+        s = M.stroke_widths(m)
+        return [[None, round(s["p50"] / size, 5) if s else None]]
+    pts = sorted({float(min(wght_axis["max"], max(wght_axis["min"], w))) for w in cfg["stem_wghts"]}
+                 | {wght_axis["min"], wght_axis["max"]})
+    out = []
+    for w in pts:
+        s = M.stroke_widths(R.render_text(cfg["specimen"], font_file, size, {"wght": w}).mask)
+        out.append([w, round(s["p50"] / size, 5) if s else None])
+    return out
+
+
+def classify(rec: dict, cfg: dict) -> dict:
+    """Geometric versus humanist signature from measured numbers (thresholds in vector.features.signature).
+    geometric_score rises with a round o, a vertical stress and a closed c; humanist_score with an open c and e
+    and an oblique stress. The label is the larger score, or 'neutral' when both stay under signature.min or
+    differ by less than signature.margin."""
+    sig = cfg["signature"]
+    o = rec.get("o", {})
+    ap_c = rec.get("aperture", {}).get("c") or 0.0
+    ap_e = rec.get("aperture", {}).get("e") or 0.0
+    roundness = 1.0 - min(1.0, abs((o.get("aspect") or 0.0) - 1.0) / sig["aspect_span"])
+    stress = o.get("stress_angle")
+    # stress_angle is the ray of maximum thickness: 0 or 180 = thick vertical sides (upright stress). 12 October 2026.
+    tilt = 0.0 if stress is None else min(abs(stress), abs(180.0 - stress)) / 90.0
+    open_ = min(1.0, (ap_c + ap_e) / sig["aperture_span"])
+    geo = round(roundness * (1 - tilt) * (1 - open_), 4)
+    hum = round(open_ * (0.5 + 0.5 * min(1.0, tilt * sig["tilt_gain"])), 4)
+    label = ("neutral" if max(geo, hum) < sig["min"] or abs(geo - hum) < sig["margin"]
+             else ("geometric" if geo >= hum else "humanist"))
+    return {"geometric": geo, "humanist": hum, "label": label}
+
+
+def measure_font(entry: dict) -> dict:
+    """Full feature record of one dataset index entry (family, file, axes). Errors are reported in the record."""
+    cfg = _cfg()
+    f = entry["file"]
+    rec = {"family": entry["family"], "file": f, "name": Path(f).name, "variable": entry.get("variable", False),
+           "axes": entry.get("axes", []), "category": entry.get("category"),
+           "licence_class": entry.get("licence_class"), "date": "12 October 2026"}
+    try:
+        missing = has_glyphs(f, cfg["specimen"] + cfg["coverage_text"])
+        rec["missing_glyphs"] = missing
+        if any(ch in missing for ch in cfg["specimen"]):
+            rec["usable"] = False
+            return rec
+        rec["usable"] = True
+        ax = regular_axes(f)
+        rec["location"] = ax
+        size = cfg["specimen_px"]
+        sp = R.render_text(cfg["specimen"], f, size, ax)
+        o = sp.outline
+        upem = R._face(f).upem
+        rec["declared"] = {"x_height": round(o.x_height_px / size, 5), "cap_height": round(o.cap_height_px / size, 5),
+                           "ascender": round(o.ascender_px / size, 5), "descender": round(o.descender_px / size, 5),
+                           "upem": upem}
+        vm = M.vertical_metrics(sp.mask)
+        rec["ink"] = {k: (round(v / size, 5) if isinstance(v, (int, float)) and k != "baseline" else None)
+                      for k, v in vm.items() if k != "baseline"}
+        st = M.stroke_widths(sp.mask)
+        rec["stroke"] = {"p10_em": round(st["p10"] / size, 5), "p50_em": round(st["p50"] / size, 5),
+                         "p90_em": round(st["p90"] / size, 5), "contrast": st["contrast"]} if st else {}
+        ta = M.terminal_angles(sp.mask)
+        tot = max(1, sum(ta["hist8"]))
+        rec["terminals"] = {"count": ta["count"], "hist8": [round(h / tot, 4) for h in ta["hist8"]]}
+        rec["specimen_width_em"] = round(o.advance_px / size, 5)
+        rec["advance_em"] = advances_em(f, ax, cfg["width_chars"])
+        lows = [v for k, v in rec["advance_em"].items() if k.islower() and v]
+        rec["mean_lower_advance_em"] = round(float(np.mean(lows)), 5) if lows else None
+        gpx = cfg["glyph_px"]
+        thr = settings.get("vector.metrics.ink_threshold")
+        ap = {}
+        for ch in ("c", "e"):
+            if ch in missing:
+                continue
+            m = _glyph_mask(ch, f, ax, gpx)
+            box = M.ink_box(m, thr)
+            if box is None:
+                continue
+            t, l, b, r = box
+            cy = t + (b - t) * (0.5 if ch == "c" else cfg["e_centre_y"])
+            ap[ch] = ray_aperture(m, (cy, (l + r) / 2), cfg["aperture_rays"], thr)
+        rec["aperture"] = ap
+        rec["o"] = o_shape(_glyph_mask("o", f, ax, gpx), thr, cfg["stress_rays"]) if "o" not in missing else {}
+        rec["holes"] = {ch: holes(_glyph_mask(ch, f, ax, gpx), thr) for ch in ("a", "g") if ch not in missing}
+        rec["stem_curve"] = stem_curve(f, cfg)
+        rec["signature"] = classify(rec, cfg)
+    except Exception as exc:
+        rec["usable"] = False
+        rec["error"] = f"{type(exc).__name__}: {exc}"
+    return rec
+
+
+def vector_of(rec: dict) -> list[float] | None:
+    """Fixed-length numeric vector of a record for nearest-neighbour search (order in vector.features.vector)."""
+    if not rec.get("usable"):
+        return None
+    out = []
+    for path in _cfg()["vector"]:
+        v = rec
+        for p in path.split("."):
+            v = v.get(p) if isinstance(v, dict) else None
+        out.append(float(v) if isinstance(v, (int, float)) else float("nan"))
+    return out

@@ -1,0 +1,399 @@
+# 12 October 2026, 10:40 CEST: fidelity of a render against its reference, per dimension, each scored 0..1.
+# Dimensions (docs/research/R05): rhythm, animation, image, colour, sound. The verdict reads the weakest one.
+# Image is judged inside a validity mask that leaves out regions whose content is deliberately replaced
+# (brand text, logos, product plates); what is outside the mask is compared pixel by pixel.
+from __future__ import annotations
+
+import numpy as np
+from skimage.color import deltaE_ciede2000, rgb2lab
+from skimage.metrics import structural_similarity
+
+from ..analyze import layers as layers_mod
+from ..media import read_frames
+
+
+def rhythm(ref_cuts: list[int], out_cuts: list[int], tolerance: int = 1) -> dict:
+    """Share of reference cuts found within +-tolerance frames, minus extra cuts."""
+    matched, errors = 0, []
+    pool = list(out_cuts)
+    for c in ref_cuts:
+        near = [o for o in pool if abs(o - c) <= tolerance]
+        if near:
+            best = min(near, key=lambda o: abs(o - c))
+            pool.remove(best)
+            matched += 1
+            errors.append(best - c)
+    extra = len(pool)
+    total = max(len(ref_cuts), 1)
+    score = max(0.0, (matched - extra) / total) if ref_cuts else (1.0 if not out_cuts else 0.0)
+    return {"score": round(score, 4), "matched": matched, "reference": len(ref_cuts), "extra": extra, "errors_frames": errors}
+
+
+def _resample(frames: list[dict], key, t0: float, t1: float, n: int) -> np.ndarray:
+    t = np.array([f["t"] for f in frames]); v = np.array([key(f) for f in frames], float)
+    grid = np.linspace(t0, t1, n)
+    return np.interp(grid, t, v, left=np.nan, right=np.nan)
+
+
+def animation(ref_el: dict, out_el: dict, size: tuple[int, int], n: int = 120) -> dict:
+    """Content-independent comparison of one matched element over the reference lifetime:
+    motion relative to the settle point, scale relative to the settle size, brightness relative to the settle
+    brightness, plus the settle position itself. Absolute ink moments depend on the letters, so they are not used."""
+    t0, t1 = ref_el["first_t"], ref_el["last_t"]
+    w, h = size
+    def series(el, key):
+        return _resample(el["frames"], key, t0, t1, n)
+    def bright(f):
+        return sum(f["color"]) / 3.0
+    parts = {}
+    for name, key, rel, norm in [("dx", lambda f: f["cx"], "sub", w), ("dy", lambda f: f["cy"], "sub", h),
+                                 ("scale", lambda f: f["sy"], "div", None), ("brightness", bright, "div", None)]:
+        a, b = series(ref_el, key), series(out_el, key)
+        ok = ~np.isnan(a) & ~np.isnan(b)
+        if ok.sum() < 3:
+            parts[name] = 0.0; continue
+        ai, bi = a[ok], b[ok]
+        tail = max(1, len(ai) // 5)
+        ra, rb = np.median(ai[-tail:]), np.median(bi[-tail:])
+        if rel == "sub":
+            ca, cb = ai - ra, bi - rb
+            scale = norm
+        else:
+            ca, cb = ai / max(ra, 1e-6), bi / max(rb, 1e-6)
+            scale = max(float(ca.max() - ca.min()), 0.05)
+        err = float(np.sqrt(np.mean((ca - cb) ** 2)) / scale)
+        parts[name] = max(0.0, 1.0 - err) * float(ok.mean())
+    # Settle point: horizontal centre of the ink box (centred text keeps it whatever the words) and the ink
+    # centroid height; the ink centroid in x depends on which letters are written.
+    def settle(el):
+        lit = sorted(el["frames"], key=lambda f: -f.get("mass", f["ink"]))[:5]
+        return np.array([[f["box"][0] + f["box"][2] / 2.0, f["cy"]] for f in lit]).mean(axis=0)
+    ra, rb = settle(ref_el), settle(out_el)
+    parts["settle"] = max(0.0, 1.0 - float(np.linalg.norm((ra - rb) / np.array([w, h]))) * 10)
+    score = float(np.mean(list(parts.values())))
+    return {"score": round(score, 4), "parts": {k: round(v, 4) for k, v in parts.items()}}
+
+
+def image(ref_video: str, out_video: str, start: float, duration: float, mask_boxes: list[list[float]] | None = None,
+          size: tuple[int, int] = (480, 270), step: int = 2) -> dict:
+    """Mean SSIM of luma outside replaced-content boxes (boxes in source pixels, 1920 wide)."""
+    w, h = size
+    a = read_frames(ref_video, w, h, gray=True, start=start, duration=duration)[::step]
+    b = read_frames(out_video, w, h, gray=True, start=0, duration=duration)[::step]
+    n = min(len(a), len(b))
+    valid = np.ones((h, w), bool)
+    for box in mask_boxes or []:
+        x, y, bw, bh = [v * w / 1920 for v in box]
+        valid[int(max(0, y)):int(min(h, y + bh + 1)), int(max(0, x)):int(min(w, x + bw + 1))] = False
+    scores = []
+    for i in range(n):
+        _, full = structural_similarity(a[i], b[i], data_range=255, full=True)
+        scores.append(float(full[valid].mean()) if valid.any() else float(full.mean()))
+    return {"score": round(float(np.mean(scores)) if scores else 0.0, 4), "frames": n,
+            "valid_share": round(float(valid.mean()), 3)}
+
+
+def colour(ref_rgb: list[float], out_rgb: list[float]) -> dict:
+    """CIEDE2000 between two colours; score 1 at dE 0, 0 at dE 10."""
+    a = rgb2lab(np.array(ref_rgb, float).reshape(1, 1, 3) / 255.0)
+    b = rgb2lab(np.array(out_rgb, float).reshape(1, 1, 3) / 255.0)
+    de = float(deltaE_ciede2000(a, b)[0, 0])
+    return {"score": round(max(0.0, 1.0 - de / 10.0), 4), "dE2000": round(de, 3)}
+
+
+def match_elements(ref: list[dict], out: list[dict]) -> list[tuple[dict, dict]]:
+    """Greedy pairing by time overlap and mean-centre distance."""
+    pairs, used = [], set()
+    for r in sorted(ref, key=lambda e: -e["peak_ink"]):
+        best, cost = None, 1e18
+        for k, o in enumerate(out):
+            if k in used:
+                continue
+            overlap = min(r["last_t"], o["last_t"]) - max(r["first_t"], o["first_t"])
+            if overlap <= 0:
+                continue
+            rc = np.mean([[f["cx"], f["cy"]] for f in r["frames"]], axis=0)
+            oc = np.mean([[f["cx"], f["cy"]] for f in o["frames"]], axis=0)
+            d = float(np.linalg.norm(rc - oc)) - overlap * 100
+            if d < cost:
+                best, cost = k, d
+        if best is not None:
+            used.add(best); pairs.append((r, out[best]))
+    return pairs
+
+
+def shot_report(ref_video: str, out_video: str, start: float, end: float, mask_boxes=None, cfg=None) -> dict:
+    ref = layers_mod.analyze_shot(ref_video, start, end, cfg)
+    out = layers_mod.analyze_shot(out_video, 0.0, end - start, cfg)
+    for el in out["elements"]:
+        for f in el["frames"]:
+            f["t"] = round(f["t"] + start, 4)
+        el["first_t"] += start; el["last_t"] += start
+    size = tuple(ref["analysis_size"])
+    pairs = match_elements(ref["elements"], out["elements"])
+    anim = [animation(r, o, size) for r, o in pairs]
+    shine = None
+    if cfg and cfg.get("group"):
+        # Text groups: the brightness part is the content-independent brightness map, not the global mean.
+        shine = light_score(ref_video, out_video, start, end - start)
+        for a in anim:
+            a["parts"]["brightness"] = shine["score"]
+            a["score"] = round(float(np.mean(list(a["parts"].values()))), 4)
+    weights = [r["peak_ink"] for r, _ in pairs]
+    anim_score = float(np.average([a["score"] for a in anim], weights=weights)) if anim else 0.0
+    unmatched = len(ref["elements"]) - len(pairs)
+    if ref["elements"]:
+        anim_score *= len(pairs) / len(ref["elements"])
+    bg = colour(np.median(ref["background"], axis=0), np.median(out["background"], axis=0))
+    typo = None
+    if cfg and cfg.get("group") and pairs:
+        # Replaced words: the image is judged outside the union of both captions' ink boxes (dilated), and the
+        # text itself by the typography dimension.
+        boxes = []
+        for el in (pairs[0][0], pairs[0][1]):
+            xs = [f["box_full"][0] for f in el["frames"]] + [f["box_full"][0] + f["box_full"][2] for f in el["frames"]]
+            ys = [f["box_full"][1] for f in el["frames"]] + [f["box_full"][1] + f["box_full"][3] for f in el["frames"]]
+            boxes.append([min(xs) - 16, min(ys) - 16, max(xs) - min(xs) + 32, max(ys) - min(ys) + 32])
+        mask_boxes = (mask_boxes or []) + boxes
+        r_el, o_el = pairs[0]
+        # Measure typography where the caption is fully lit (most ink mass), not inside a fade.
+        settle_r = max(r_el["frames"], key=lambda f: f.get("mass", f["ink"]))
+        settle_o = min(o_el["frames"], key=lambda f: abs(f["t"] - settle_r["t"]))
+        typo = typography(ref_video, out_video, settle_r["t"], settle_o["t"] - start, settle_r["box_full"])
+    img = image(ref_video, out_video, start, end - start, mask_boxes)
+    dims = {"animation": round(anim_score, 4), "image": img["score"], "colour": bg["score"]}
+    if typo is not None:
+        dims["typography"] = typo["score"]
+    return {"dimensions": dims, "weakest": min(dims, key=dims.get), "score": min(dims.values()),
+            "elements": {"reference": len(ref["elements"]), "render": len(out["elements"]), "matched": len(pairs), "unmatched": unmatched},
+            "animation_detail": anim, "brightness_map": shine, "typography_detail": typo, "background": bg, "image_detail": img}
+
+
+def brightness_map(video: str, start: float, duration: float, bins: int = 24, bg_level: float = 0.0,
+                   ink_threshold: float = 40.0) -> np.ndarray:
+    """Ink brightness over (time, position across the ink extent): content-independent picture of a text effect.
+    Each frame's ink is cut into `bins` equal slices between its leftmost and rightmost ink columns."""
+    frames = read_frames(video, 960, 540, gray=True, start=start, duration=duration).astype(np.float32)
+    out = np.full((len(frames), bins), np.nan)
+    for i, f in enumerate(frames):
+        ink = np.abs(f - bg_level) > ink_threshold
+        cols = np.nonzero(ink.any(axis=0))[0]
+        if len(cols) < bins:
+            continue
+        lo, hi = cols.min(), cols.max() + 1
+        edges = np.linspace(lo, hi, bins + 1).astype(int)
+        for k in range(bins):
+            m = ink[:, edges[k]:edges[k + 1]]
+            if m.any():
+                out[i, k] = f[:, edges[k]:edges[k + 1]][m].mean()
+    return out
+
+
+def brightness_score_map(ref_video: str, out_video: str, start: float, duration: float) -> dict:
+    a = brightness_map(ref_video, start, duration)
+    b = brightness_map(out_video, 0.0, duration)
+    n = min(len(a), len(b)); a, b = a[:n], b[:n]
+    ok = ~np.isnan(a) & ~np.isnan(b)
+    if ok.sum() < 10:
+        return {"score": 0.0}
+    # Compare the relative pattern (each map divided by its own settled level), so a uniform gain is a separate part.
+    sa = np.nanmedian(a[-max(1, n // 5):], axis=0); sb = np.nanmedian(b[-max(1, n // 5):], axis=0)
+    la, lb = np.nanmedian(sa), np.nanmedian(sb)
+    # Relative to each bin's settled value: the letters' own shading cancels, the animation remains.
+    ra, rb = (a / sa)[ok], (b / sb)[ok]
+    span = max(float(ra.max() - ra.min()), 0.05)
+    pattern = max(0.0, 1.0 - float(np.sqrt(np.mean((ra - rb) ** 2))) / span)
+    level = max(0.0, 1.0 - abs(la - lb) / 255.0 * 10)
+    corr = float(np.corrcoef(ra, rb)[0, 1]) if ra.std() > 0 and rb.std() > 0 else 0.0
+    ea = np.nanmean(np.clip(a / sa - 1, 0, None)[a / sa - 1 > 0.05]) if np.any(a / sa - 1 > 0.05) else 0.0
+    eb = np.nanmean(np.clip(b / sb - 1, 0, None)[b / sb - 1 > 0.05]) if np.any(b / sb - 1 > 0.05) else 0.0
+    return {"score": round(min(pattern, level), 4), "pattern": round(pattern, 4), "level": round(level, 4),
+            "ref_excess": round(float(ea), 4), "out_excess": round(float(eb), 4),
+            "correlation": round(corr, 4), "ref_level": round(float(la), 1), "out_level": round(float(lb), 1)}
+
+
+def brightness_score(ref_video: str, out_video: str, start: float, duration: float) -> dict:
+    """Text brightness compared in model space: the travelling band (centre, strength) and the settled level,
+    each fitted the same way on both videos, so different words compare fairly."""
+    from ..analyze.effects import band_series
+    a = brightness_map(ref_video, start, duration); b = brightness_map(out_video, 0.0, duration)
+    n = min(len(a), len(b)); a, b = a[:n], b[:n]
+    ra, rb = band_series(a), band_series(b)
+    peak = max(ra["peak_rel"], 1e-3)
+    # The sweep is the longest run of reference frames with a clear band; compare inside it (+-4 frames).
+    strong = [bool(f and f["a"] > 0.3) for f in ra["frames"]]
+    runs, cur = [], None
+    for i, flag in enumerate(strong):
+        if flag and cur is None:
+            cur = i
+        if not flag and cur is not None:
+            runs.append((cur, i - 1)); cur = None
+    if cur is not None:
+        runs.append((cur, len(strong) - 1))
+    lo, hi = max(runs, key=lambda r: r[1] - r[0]) if runs else (0, -1)
+    lo, hi = max(0, lo - 4), min(n - 1, hi + 4)
+    ca, cb, aa, ab = [], [], [], []
+    for i, (fa, fb) in enumerate(zip(ra["frames"], rb["frames"])):
+        if fa is None or fb is None or not lo <= i <= hi:
+            continue
+        sa, sb = fa["a"] * ra["peak_rel"] / peak, fb["a"] * rb["peak_rel"] / peak
+        aa.append(sa); ab.append(sb)
+        if fa["a"] > 0.05 or fb["a"] > 0.05:
+            w = max(sa, sb)
+            ca.append((fa["c"], fb["c"], w))
+    aa, ab = np.array(aa), np.array(ab)
+    strength = max(0.0, 1.0 - float(np.sqrt(np.mean((aa - ab) ** 2))) / max(float(aa.max()), 1e-3)) if len(aa) else 0.0
+    if ca:
+        c = np.array(ca)
+        position = max(0.0, 1.0 - float(np.sqrt(np.average((c[:, 0] - c[:, 1]) ** 2, weights=c[:, 2] + 1e-6))) / 100.0)
+    else:
+        position = 1.0 if aa.max(initial=0) < 0.05 else 0.0
+    la = float(np.nanmedian(a[-max(1, n // 5):])); lb = float(np.nanmedian(b[-max(1, n // 5):]))
+    level = max(0.0, 1.0 - abs(la - lb) / 255.0 * 10)
+    return {"score": round(min(strength, position, level), 4), "strength": round(strength, 4), "position": round(position, 4),
+            "level": round(level, 4), "ref_level": round(la, 1), "out_level": round(lb, 1),
+            "ref_excess": round(float(aa.max(initial=0) * ra["peak_rel"]), 4) if len(aa) else 0.0,
+            "out_excess": round(float(ab.max(initial=0) * ra["peak_rel"]), 4) if len(ab) else 0.0}
+
+
+def sweep_window(bmap: np.ndarray, threshold: float = 0.1) -> tuple[int, int]:
+    """Frames of the main highlight pass: longest run where some slice exceeds its settled value by `threshold`."""
+    settled = np.nanmedian(bmap[-max(1, len(bmap) // 5):], axis=0)
+    with np.errstate(all="ignore"):
+        strong = np.nanmax(bmap / settled - 1.0, axis=1) > threshold
+    runs, cur = [], None
+    for i, flag in enumerate(strong):
+        if flag and cur is None:
+            cur = i
+        if not flag and cur is not None:
+            runs.append((cur, i - 1)); cur = None
+    if cur is not None:
+        runs.append((cur, len(strong) - 1))
+    return max(runs, key=lambda r: r[1] - r[0]) if runs else (0, len(bmap) - 1)
+
+
+def sweep_arrival(bmap: np.ndarray, window: tuple[int, int] | None = None) -> tuple[np.ndarray, np.ndarray, float]:
+    """For each slice across the text: the frame where its relative brightness peaks, and that peak excess."""
+    settled = np.nanmedian(bmap[-max(1, len(bmap) // 5):], axis=0)
+    rel = bmap / settled
+    with np.errstate(all="ignore"):
+        gain = np.nanmedian(np.where(rel <= np.nanpercentile(rel, 60, axis=1, keepdims=True), rel, np.nan), axis=1)
+    resid = np.nan_to_num(rel - gain[:, None], nan=0.0)
+    if window:
+        lo, hi = window
+        mask = np.zeros(len(resid), bool); mask[max(0, lo):hi + 1] = True
+        resid = np.where(mask[:, None], resid, 0.0)
+    return np.argmax(resid, axis=0).astype(float), resid.max(axis=0), float(np.nanmedian(settled))
+
+
+def brightness_score_v3(ref_video: str, out_video: str, start: float, duration: float, fps: float = 60.0,
+                        tolerance_frames: float = 2.0) -> dict:
+    """Content-independent text brightness: when the highlight reaches each slice (arrival), how strong it is
+    there (strength), and the settled level. Slices without a clear highlight in the reference are skipped."""
+    a = brightness_map(ref_video, start, duration); b = brightness_map(out_video, 0.0, duration)
+    n = min(len(a), len(b)); a, b = a[:n], b[:n]
+    lo, hi = sweep_window(a)
+    window = (lo - 6, hi + 6)
+    ta, ea, la = sweep_arrival(a, window); tb, eb, lb = sweep_arrival(b, window)
+    use = ea > 0.08
+    if not use.any():
+        strength = position = 1.0
+    else:
+        span = max(float(ta[use].max() - ta[use].min()), 6.0)
+        # Tolerance: one frame of the reference's real cadence (2 frames at 60 fps for 30 fps content).
+        position = max(0.0, 1.0 - max(0.0, float(np.mean(np.abs(ta[use] - tb[use]))) - tolerance_frames) / span)
+        strength = max(0.0, 1.0 - float(np.mean(np.abs(ea[use] - eb[use]))) / float(np.mean(ea[use])))
+    level = max(0.0, 1.0 - abs(la - lb) / 255.0 * 10)
+    return {"score": round(min(position, strength, level), 4), "position": round(position, 4), "strength": round(strength, 4),
+            "level": round(level, 4), "ref_level": round(la, 1), "out_level": round(lb, 1),
+            "ref_excess": round(float(ea[use].mean()) if use.any() else 0.0, 4),
+            "out_excess": round(float(eb[use].mean()) if use.any() else 0.0, 4),
+            "arrival_error_frames": round(float(np.mean(np.abs(ta[use] - tb[use]))) if use.any() else 0.0, 2)}
+
+
+def light_score(ref_video: str, out_video: str, start: float, duration: float, shift_frames: int = 2,
+                jnd_rel: float = 0.02) -> dict:
+    """Text light compared as plateau-normalised maps (slice across the text x time), so words cancel out.
+    Score = 1 - mean |ref - out| / mean |ref - 1| (relative error of the light animation), best over a +-shift
+    of one source-cadence frame; level = settled plateau brightness, 1 at equal and 0 at 25 levels apart."""
+    from ..analyze.effects import light_map
+    a = brightness_map(ref_video, start, duration); b = brightness_map(out_video, 0.0, duration)
+    n = min(len(a), len(b)); a, b = a[:n], b[:n]
+    la, lb = light_map(a), light_map(b)
+    if not (la["ok"] and lb["ok"]):
+        return {"score": 0.0, "error": "no ink"}
+    ra, rb = la["rel"], lb["rel"]
+    # Slices that hold no ink on the plateau in either video (gaps between words) say nothing about the light.
+    cols = la["valid_bins"] & lb["valid_bins"]
+    ra, rb = ra[:, cols], rb[:, cols]
+    motion = float(np.mean(np.abs(ra - 1)))
+    best = None
+    for s in range(-shift_frames, shift_frames + 1):
+        x = ra[max(0, s):n + min(0, s)]; y = rb[max(0, -s):n - max(0, s)]
+        err = float(np.mean(np.abs(x - y)))
+        best = err if best is None else min(best, err)
+    # Perceptual scoring (R03 section 7, R04 section 11): an error of one just-noticeable difference scores 0.99.
+    # Luminance JND: Weber fraction jnd_rel (2 percent) for the light pattern and the plateau level alike.
+    pattern = 0.99 ** ((best / jnd_rel) ** 2)
+    level_err = abs(la["level"] - lb["level"]) / max(la["level"], 1e-6)
+    level = 0.99 ** ((level_err / jnd_rel) ** 2)
+    strict = max(0.0, 1.0 - best / max(motion, 0.05))
+    return {"score": round(min(pattern, level), 4), "pattern": round(pattern, 4), "level": round(level, 4),
+            "strict_pattern": round(strict, 4), "jnd_rel": jnd_rel,
+            "ref_level": round(la["level"], 1), "out_level": round(lb["level"], 1), "mean_abs_err": round(best, 4),
+            "ref_motion": round(motion, 4)}
+
+
+def typography(ref_video: str, out_video: str, t_ref: float, t_out: float, box: list[float], jnd_x: float = 0.02,
+               jnd_stroke: float = 0.05) -> dict:
+    """Settled caption typography, independent of the words: x-height and stroke thickness, in JND units."""
+    from ..analyze import typography as ty
+    from ..media import frame_at
+    x, y, w, h = [int(round(v)) for v in box]
+    pad = 30
+    def crop(video, t):
+        f = frame_at(video, t, 1920, 1080).astype(np.float32).max(axis=2) / 255.0
+        c = f[max(0, y - pad):y + h + pad, max(0, x - pad):x + w + pad]
+        return c / max(float(c.max()), 1e-6)
+    a, b = crop(ref_video, t_ref), crop(out_video, t_out)
+    ma, mb = ty.line_metrics(a), ty.line_metrics(b)
+    sa, sb = ty.stroke_width(a), ty.stroke_width(b)
+    if not (ma and mb and sa and sb):
+        return {"score": 0.0, "error": "no text"}
+    ex = abs(ma["x_height"] - mb["x_height"]) / ma["x_height"] / jnd_x
+    es = abs(sa - sb) / sa / jnd_stroke
+    return {"score": round(0.99 ** (ex ** 2 + es ** 2), 4), "x_height": [ma["x_height"], mb["x_height"]],
+            "stroke": [round(sa, 2), round(sb, 2)], "jnd": {"x_height": jnd_x, "stroke": jnd_stroke}}
+
+
+def rhythm_presence(ref_cuts: list[int], video: str, tolerance: int = 1, ratio: float = 4.0, ref_video: str | None = None,
+                    ref_start: float = 0.0) -> dict:
+    """Cut presence test: for each reference cut frame, does the render jump there (+-tolerance), i.e. is the frame
+    difference a local peak at least `ratio` times the local median? Extra = strong peaks away from every cut.
+    Works for smooth content where an edge-based detector sees nothing."""
+    from ..analyze.shots import signals
+    sig = signals(video, 160, 90)
+    d = sig["mad"] + sig["chi"]
+    n = len(d)
+    def is_jump(i):
+        lo, hi = max(1, i - 15), min(n, i + 16)
+        base = np.median(d[lo:hi]) + 1e-4
+        return d[i] >= ratio * base and d[i] >= d[max(1, i - 2):min(n, i + 3)].max() - 1e-9
+    found, errors = 0, []
+    for c in ref_cuts:
+        hits = [i for i in range(c - tolerance, c + tolerance + 1) if 1 <= i < n and is_jump(i)]
+        if hits:
+            found += 1; errors.append(min(hits, key=lambda i: abs(i - c)) - c)
+    near = set(i for c in ref_cuts for i in range(c - tolerance, c + tolerance + 1))
+    if ref_video:
+        # In-shot events of the reference (light flashes, pop-ins) are jumps too: a faithful render repeats them.
+        rsig = signals(ref_video, 160, 90)
+        rd = rsig["mad"] + rsig["chi"]
+        for i in range(1, min(len(rd), n)):
+            lo, hi = max(1, i - 15), min(len(rd), i + 16)
+            if rd[i] >= ratio * (np.median(rd[lo:hi]) + 1e-4) and rd[i] > 0.05:
+                near.update(range(i - tolerance, i + tolerance + 1))
+    extra = [i for i in range(1, n) if i not in near and is_jump(i) and d[i] > 0.05]
+    score = max(0.0, (found - len(extra)) / max(len(ref_cuts), 1))
+    return {"score": round(score, 4), "found": found, "reference": len(ref_cuts), "extra": len(extra),
+            "extra_frames": extra[:20], "errors_frames": errors}

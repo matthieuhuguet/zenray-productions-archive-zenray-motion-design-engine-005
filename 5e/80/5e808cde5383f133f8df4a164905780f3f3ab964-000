@@ -1,0 +1,58 @@
+# 12 October 2026, 03:35 CEST: labelled contact sheets (time and frame under every thumbnail).
+# ffmpeg here has no drawtext, so labels are drawn with Pillow. Used by the storyboard and for eye checks.
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+from .media import iter_frames, probe
+
+FONT_CANDIDATES = ["/Users/zenray/Library/Fonts/AnthropicMono-Regular.ttf", "/System/Library/Fonts/SFNSMono.ttf",
+                   "/System/Library/Fonts/Supplemental/Arial.ttf"]
+
+
+def _font(size: int):
+    for candidate in FONT_CANDIDATES:
+        if Path(candidate).exists():
+            try:
+                return ImageFont.truetype(candidate, size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def contact_sheet(video: str | Path, out: str | Path, *, start: float = 0.0, end: float | None = None, step_s: float = 0.1,
+                  cols: int = 10, thumb_w: int = 256, marks: dict[float, str] | None = None, title: str = "") -> Path:
+    """Thumbnails every step_s seconds between start and end, labelled 't=12.30s f=738'. marks draws a red edge."""
+    info = probe(video)
+    fps = info["fps"]
+    end = min(end if end is not None else info["duration"], info["duration"])
+    thumb_h = int(round(thumb_w * info["height"] / info["width"]))
+    times = list(np.arange(start, end, step_s))
+    frames = list(iter_frames(video, thumb_w, thumb_h, fps=1.0 / step_s, start=start, duration=end - start))
+    label_h, pad = 18, 4
+    rows = (len(frames) + cols - 1) // cols
+    head = 28 if title else 0
+    sheet = Image.new("RGB", (cols * (thumb_w + pad) + pad, head + rows * (thumb_h + label_h + pad) + pad), (40, 40, 40))
+    draw = ImageDraw.Draw(sheet)
+    font, big = _font(12), _font(16)
+    if title:
+        draw.text((pad, 6), title, fill=(235, 235, 235), font=big)
+    marks = marks or {}
+    for k, frame in enumerate(frames):
+        t = start + k * step_s
+        x = pad + (k % cols) * (thumb_w + pad)
+        y = head + pad + (k // cols) * (thumb_h + label_h + pad)
+        sheet.paste(Image.fromarray(frame), (x, y))
+        label = f"t={t:.2f}s f={int(round(t * fps))}"
+        hit = [v for mt, v in marks.items() if t - step_s / 2 <= mt < t + step_s / 2]
+        if hit:
+            draw.rectangle([x - 2, y - 2, x + thumb_w + 1, y + thumb_h + 1], outline=(230, 60, 40), width=3)
+            label += " " + hit[0]
+        draw.text((x + 2, y + thumb_h + 2), label, fill=(240, 220, 120), font=font)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out)
+    return out

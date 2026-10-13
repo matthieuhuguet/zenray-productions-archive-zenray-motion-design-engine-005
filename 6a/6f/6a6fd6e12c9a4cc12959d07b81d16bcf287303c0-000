@@ -1,0 +1,97 @@
+# 12 October 2026, 12:40 CEST: caption overlays rebuilt on top of a plate (colour animatic) shot.
+# For each line found by zrmd.analyze.overlays: x-height and stroke at the lit frame (top-hat ink), the matched
+# free font, the ink colour of the stroke cores, the box centre, and a light map over the line's slices
+# measured with the same top-hat ink, so fades, wipes and sweeps come back as data. Words: an original phrase
+# of similar length from the bank in datasets/caption-bank.json (a parameter Matthieu edits).
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+from .. import settings
+from ..analyze import typography as ty
+from ..analyze.overlays import overlay_lines, tophat_ink
+from ..media import frame_at, read_frames
+
+BANK = settings.REPO / "datasets" / "caption-bank.json"
+
+
+def pick_words(length: int, used: set) -> str:
+    bank = json.loads(BANK.read_text(encoding="utf-8"))["phrases"]
+    for phrase in sorted(bank, key=lambda p: abs(len(p) - length)):
+        if phrase not in used:
+            used.add(phrase)
+            return phrase
+    return bank[0]
+
+
+def light_rows(frames: np.ndarray, box, bins: int = 24, mask: np.ndarray | None = None, active=None) -> tuple[np.ndarray, float]:
+    """Caption light per frame and slice: top-hat brightness on the caption's own ink mask (lit frame), minus the
+    plate's level on that mask before the caption is on (baseline), relative to each slice's plateau. On a
+    replaced plate only the caption's light is compared, never the photo's texture behind it."""
+    x, y, w, h = box
+    th_all = np.stack([tophat_ink(f[y:y + h, x:x + w]).astype(np.float32) for f in frames])
+    if mask is None:
+        lit = int(np.argmax(th_all.reshape(len(frames), -1).sum(axis=1)))
+        mask = th_all[lit] > 0.35 * th_all[lit].max()
+    edges = np.linspace(0, w, bins + 1).astype(int)
+    rows = np.full((len(frames), bins), np.nan)
+    for k in range(bins):
+        m = mask[:, edges[k]:edges[k + 1]]
+        if m.sum() < 3:
+            continue
+        rows[:, k] = th_all[:, :, edges[k]:edges[k + 1]][:, m].mean(axis=1)
+    if active is not None:
+        a0, a1 = active
+        off = [i for i in range(len(frames)) if i < a0 - 2 or i > a1 + 2]
+        base = np.nanmedian(rows[off], axis=0) if len(off) >= 3 else np.zeros(bins)
+        rows = np.clip(rows - np.nan_to_num(base), 0, None)
+    med = np.nanmedian(rows, axis=1)
+    fin = np.isfinite(med)
+    if not fin.any() or np.nanmax(med) <= 0:
+        return np.zeros((len(frames), bins)), 0.0
+    top = np.nanpercentile(med[fin], 70)
+    plateau = fin & (np.abs(med - top) <= 0.08 * max(top, 1e-6))
+    per_bin = np.nanmedian(rows[plateau], axis=0) if plateau.sum() >= 3 else np.nanmax(rows, axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rel = rows / per_bin
+    rel = np.where(np.isfinite(rel), rel, 0.0)
+    return np.round(rel, 3), float(np.nanmedian(per_bin))
+
+
+def build_layers(video: str, start: float, end: float, font_file: str, family: str = "ZrCaption") -> list[dict]:
+    lines = overlay_lines(video, start, end)
+    if not lines:
+        return []
+    fps = 60
+    frames = read_frames(video, 1920, 1080, gray=True, start=start, duration=end - start)
+    used, layers = set(), []
+    for n, L in enumerate(lines):
+        x, y, w, h = L["box"]
+        lit_t = start + L["lit_frame"] / fps
+        rgb = frame_at(video, lit_t, 1920, 1080)
+        gray = rgb.astype(np.float32).mean(axis=2)
+        th = tophat_ink(gray[y:y + h, x:x + w].astype(np.uint8)).astype(np.float32)
+        norm = th / max(th.max(), 1e-6)
+        met = ty.line_metrics(norm)
+        if not met:
+            continue
+        stroke = ty.stroke_width(norm)
+        core = ty.core_colour(rgb[y:y + h, x:x + w].astype(np.float32), norm) or [240.0, 240.0, 240.0]
+        n_chars = max(4, int(round(met["width"] / max(met["x_height"] * 0.55, 1))))
+        words = pick_words(n_chars, used)
+        size = ty.size_for_x_height(words, font_file, met["x_height"], 400)
+        rel, _ = light_rows(frames, L["box"], active=(L["first_frame"], L["last_frame"]))
+        cx = x + w / 2.0
+        cy = y + (met["x_top"] + met["baseline"]) / 2.0
+        layers.append({"id": f"ov{n + 1}", "type": "text", "text": words, "color": "#ffffff", "x": round(cx, 2), "y": round(cy, 2),
+                       "anchor": [0.5, 0.5], "z": 5,
+                       "font": {"family": family, "weight": 400, "size": size, "tracking": 0.0, "variation": "'wght' 400"},
+                       "initial": {"brightness": 1.0},
+                       "lightmap": {"bins": int(rel.shape[1]), "start_frame": 0, "base": [round(float(c), 1) for c in core],
+                                    "gain": 1.0, "rel": rel.tolist()},
+                       "measured": {"box": L["box"], "x_height": met["x_height"], "stroke_px": stroke, "active": [L["start"], L["end"]]},
+                       "tracks": {}})
+    return layers

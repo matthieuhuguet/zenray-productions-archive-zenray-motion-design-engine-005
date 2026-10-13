@@ -1,0 +1,594 @@
+# 12 October 2026: F3, 1:1 reproduction of the texts and 2D marks of a reference (private benchmark), then variations.
+# A mark is read from the reference as a coverage map over a local background (alpha matting with a known ink
+# colour), fitted by a font (text) or traced by zrmd.vector.asset (svg), and written as a motion version V_NNN with
+# params.json, render.png, asset.svg and fidelity.json (mask IoU, edge distance, colour dE2000). Every threshold and
+# step lives in settings.json, section vector.marks (HDA law). Nothing here pastes reference pixels into an output:
+# the reference crop is only read to measure.
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from scipy.optimize import least_squares, minimize
+
+from zrmd import settings
+from zrmd.vector import metrics as M
+from zrmd.vector import render as R
+
+ROOT = Path(__file__).resolve().parents[3]          # /Users/zenray/.claude/tmp/tmp-zenray-motion-design
+REFCACHE = ROOT.parent / "tmp-zenray-motion-design-refcache"
+
+
+def _cfg() -> dict:
+    return settings.get("vector.marks")
+
+
+def inventory(slug: str) -> dict:
+    return json.loads((ROOT / "references" / slug / "marks-f3.json").read_text(encoding="utf-8"))
+
+
+def reference_video(slug: str) -> Path:
+    ref = json.loads((ROOT / "references" / slug / "reference.json").read_text(encoding="utf-8"))
+    name = ref.get("file_name")
+    cands = list((REFCACHE / slug).glob("*.mp4"))
+    if name:
+        cands = [c for c in cands if c.name == Path(name).name] or cands
+    if not cands:
+        raise FileNotFoundError(f"no reference video for {slug} in {REFCACHE / slug}")
+    return cands[0]
+
+
+def mark_cache(slug: str, mark_id: str) -> Path:
+    """Analysis-only crops live in the reference cache, never in a deliverable (12 October 2026)."""
+    d = REFCACHE / slug / "f3" / "marks" / mark_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# ---------------------------------------------------------------- frame choice (12 October 2026)
+
+def _decode_window(video: Path, t0: float, t1: float, region, fps: float) -> list[np.ndarray]:
+    x, y, w, h = region
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{t0:.4f}", "-i", str(video), "-t", f"{t1 - t0:.4f}",
+                        "-vf", f"crop={w}:{h}:{x}:{y},fps={fps}", "-start_number", "0", f"{tmp}/f%04d.png"], check=True)
+        return [np.asarray(Image.open(p).convert("RGB")) for p in sorted(Path(tmp).glob("f*.png"))]
+
+
+def top_hat(rgb: np.ndarray, size: int) -> np.ndarray:
+    g = np.asarray(rgb, np.float32).mean(axis=2)
+    return np.clip(g - ndi.grey_opening(g, size=(size, size)), 0, None)
+
+
+def choose_frame(slug: str, mark: dict) -> dict:
+    """Pick the frame of highest steady contrast in the mark window: score = top-hat energy minus the change to the
+    neighbouring frames (a fading or moving frame loses). Writes crop.png and full.png in the cache."""
+    cfg = _cfg()["extract"]
+    video = reference_video(slug)
+    t0, t1 = mark["window"]
+    frames = _decode_window(video, t0, t1, mark["region"], cfg["fps"])
+    if not frames:
+        raise RuntimeError(f"{mark['id']}: no frame decoded in {t0}..{t1}")
+    th = [top_hat(f, cfg["tophat_px"]) for f in frames]
+    energy = np.array([t.sum() for t in th])
+    change = np.zeros(len(th))
+    for i in range(len(th)):
+        nb = [j for j in (i - 1, i + 1) if 0 <= j < len(th)]
+        change[i] = np.mean([np.abs(th[i] - th[j]).sum() for j in nb]) if nb else 0.0
+    score = energy - cfg["motion_weight"] * change
+    i = int(np.argmax(score))
+    t = t0 + i / cfg["fps"]
+    d = mark_cache(slug, mark["id"])
+    Image.fromarray(frames[i]).save(d / "crop.png")
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-ss", f"{t:.4f}", "-i", str(video), "-frames:v", "1",
+                    str(d / "full.png")], check=True)
+    info = {"id": mark["id"], "time_s": round(t, 4), "frame_index_in_window": i, "frames": len(frames),
+            "energy": round(float(energy[i]), 1), "change": round(float(change[i]), 1), "region": mark["region"],
+            "date": "12 October 2026"}
+    (d / "frame.json").write_text(json.dumps(info, indent=1))
+    return info
+
+
+# ---------------------------------------------------------------- reference coverage (12 October 2026)
+
+def coverage(rgb: np.ndarray, occluders=None) -> dict:
+    """Alpha matting of light text over a local background. Background B = grey opening (removes strokes thinner
+    than tophat_px) smoothed; ink colour I = median of the strongest top-hat pixels; coverage c = projection of
+    (rgb - B) on (I - B). weight = 0 where the two-colour model does not explain the pixel (a foreground object),
+    dilated, and inside explicit occluder boxes. Returns c, weight, B, I, residual."""
+    cfg = _cfg()["coverage"]
+    a = np.asarray(rgb, np.float32)
+    size = cfg["background_px"]
+    B = np.stack([ndi.grey_opening(a[..., k], size=(size, size)) for k in range(3)], axis=2)
+    B = np.stack([ndi.gaussian_filter(B[..., k], cfg["background_smooth_px"]) for k in range(3)], axis=2)
+    B = np.minimum(B, a)                                 # light text: the background never exceeds the pixel
+    diff = a - B
+    th = diff.mean(axis=2)
+    core = th >= np.percentile(th, cfg["ink_percentile"])
+    I = np.median(a[core], axis=0)
+    v = I[None, None, :] - B
+    c = np.clip((diff * v).sum(axis=2) / np.maximum((v * v).sum(axis=2), 1e-3), 0.0, 1.0)
+    model = B + c[..., None] * v
+    res = np.sqrt(((a - model) ** 2).mean(axis=2))
+    w = np.ones(c.shape, np.float32)
+    # 12 October 2026: low contrast background (a bright object behind the text) cannot be read as coverage
+    contrast = np.sqrt((v * v).sum(axis=2)) / max(float(np.sqrt((I * I).sum())), 1e-3)
+    low = ndi.binary_dilation(contrast < cfg["min_contrast"], iterations=cfg["occluder_dilate_px"])
+    w[low] = 0.0
+    occ = {"auto": True, "boxes": []} if occluders == "auto" else (occluders or {})
+    if occ.get("auto"):
+        bad = ndi.binary_opening(res > cfg["residual_max"], iterations=1)
+        bad = ndi.binary_dilation(bad, iterations=cfg["occluder_dilate_px"])
+        w[bad] = 0.0
+    for x, y, ww, hh in occ.get("boxes", []):
+        w[y:y + hh, x:x + ww] = 0.0
+    return {"c": c.astype(np.float32), "weight": w, "B": B, "I": I, "residual": res}
+
+
+def line_components(c: np.ndarray, band_frac: float, extent_tol: float,
+                    max_width_band: float = 3.0, min_thick_frac: float = 0.45,
+                    max_gap_band: float = 1.5) -> tuple[np.ndarray, tuple[int, int]]:
+    """Ink components of the text line (12 October 2026). The line band is the run of rows whose ink sum is at least
+    band_frac of the peak row (heaviest run). A component is kept when it touches the band and stays inside it
+    extended by extent_tol band heights above and below (ascenders, descenders, accents); a streak or an object
+    that crosses the band and runs far outside it is left out. Returns (keep mask, band rows)."""
+    ink = c > 0.5
+    if not ink.any():
+        raise ValueError("no ink in the region")
+    rows = (c * ink).sum(axis=1)
+    on = rows >= band_frac * rows.max()
+    runs, start = [], None
+    for i, v in enumerate(list(on) + [False]):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            runs.append((start, i))
+            start = None
+    r0, r1 = max(runs, key=lambda r: rows[r[0]:r[1]].sum())
+    tol = extent_tol * (r1 - r0)
+    lab, n = ndi.label(ink)
+    keep = np.zeros(n + 1, bool)
+    # 12 October 2026: stroke thickness of each component (max of the distance transform); thin streak pieces are
+    # far thinner than the glyph strokes of the line (area-weighted median), so they are left out.
+    dt = ndi.distance_transform_edt(ink)
+    idx = np.arange(1, n + 1)
+    thick = ndi.maximum(dt, lab, idx)
+    area = ndi.sum(ink, lab, idx)
+    order = np.argsort(thick)
+    cum = np.cumsum(area[order])
+    ref_thick = thick[order][np.searchsorted(cum, cum[-1] / 2)] if n else 0.0
+    for k, sl in enumerate(ndi.find_objects(lab), start=1):
+        if thick[k - 1] < min_thick_frac * ref_thick:
+            continue
+        touches = sl[0].start < r1 and sl[0].stop > r0
+        inside = sl[0].start >= r0 - tol and sl[0].stop <= r1 + tol
+        narrow = (sl[1].stop - sl[1].start) <= max_width_band * (r1 - r0)   # a glyph, not a streak
+        keep[k] = touches and inside and narrow
+    # 12 October 2026: the line is one horizontal cluster; kept components separated from it by more than
+    # max_gap_band band heights (a streak piece, a far object) are dropped, the heaviest cluster stays.
+    objs = ndi.find_objects(lab)
+    ks = sorted([k for k in range(1, n + 1) if keep[k]], key=lambda k: objs[k - 1][1].start)
+    clusters, cur, right = [], [], None
+    for k in ks:
+        sl = objs[k - 1][1]
+        if cur and sl.start - right > max_gap_band * (r1 - r0):
+            clusters.append(cur)
+            cur = []
+        cur.append(k)
+        right = sl.stop if right is None or not cur[:-1] else max(right, sl.stop)
+    if cur:
+        clusters.append(cur)
+    if clusters:
+        heavy = max(clusters, key=lambda cl: sum(area[k - 1] for k in cl))
+        keep[:] = False
+        keep[heavy] = True
+    return keep[lab], (r0, r1)
+
+
+def ink_crop_box(c: np.ndarray, margin: int, band_frac: float = 0.1, extent_tol: float = 0.6) -> tuple[int, int, int, int]:
+    """Box (top, left, bottom, right) of the kept line components plus margin. 12 October 2026."""
+    keep, _ = line_components(c, band_frac, extent_tol)
+    ys, xs = np.nonzero(keep)
+    h, w = c.shape
+    return (max(0, ys.min() - margin), max(0, xs.min() - margin), min(h, ys.max() + 1 + margin), min(w, xs.max() + 1 + margin))
+
+
+def local_ink(rgb: np.ndarray, B: np.ndarray, keep: np.ndarray, bin_px: float, core_percentile: float) -> dict:
+    """Ink colour along x (12 October 2026): the text of this reference brightens and dims along the line (shine,
+    two-tone words). The kept ink is cut in bins of about bin_px; per bin, the median colour of its strongest pixels
+    (top-hat above core_percentile of the bin). Returns bin edges in crop x and colours, and a per-column map."""
+    xs = np.nonzero(keep.any(axis=0))[0]
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    nb = max(1, int(round((x1 - x0) / bin_px)))
+    edges = np.linspace(x0, x1, nb + 1)
+    diff = (rgb - B).mean(axis=2)
+    cols = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        sl = np.zeros_like(keep)
+        sl[:, int(a):int(np.ceil(b))] = True
+        m = keep & sl
+        if m.sum() < 4:
+            cols.append(None)
+            continue
+        thr = np.percentile(diff[m], core_percentile)
+        cols.append(np.median(rgb[m & (diff >= thr)], axis=0))
+    good = [c for c in cols if c is not None]
+    cols = [c if c is not None else np.mean(good, axis=0) for c in cols]
+    centres = (edges[:-1] + edges[1:]) / 2
+    W = rgb.shape[1]
+    colmap = np.stack([np.interp(np.arange(W), centres, [c[k] for c in cols]) for k in range(3)], axis=1)
+    return {"x0": x0, "x1": x1, "centres": centres.tolist(), "colours": [list(map(float, c)) for c in cols],
+            "column_rgb": colmap.astype(np.float32)}
+
+
+# ---------------------------------------------------------------- fidelity (12 October 2026)
+
+def fidelity(ref_c: np.ndarray, out_c: np.ndarray, weight: np.ndarray, ref_rgb: np.ndarray, out_rgb: np.ndarray) -> dict:
+    """Mask IoU (soft, weighted, and hard at 0.5), sub-pixel edge distance both ways, and colour dE2000 between the
+    reference pixels and the rendered composite, over the ink band (either coverage above 0.1)."""
+    from skimage.color import deltaE_ciede2000, rgb2lab
+    w = weight
+    soft = M.weighted_iou(ref_c, out_c, w)
+    a, b = (ref_c >= 0.5) & (w > 0), (out_c >= 0.5) & (w > 0)
+    hard = float((a & b).sum()) / max(float((a | b).sum()), 1.0)
+    e = M.subpixel_edge_distance(ref_c, out_c, w)
+    band = ((ref_c > 0.1) | (out_c > 0.1)) & (w > 0)
+    la = rgb2lab(np.clip(ref_rgb, 0, 255).astype(np.float64) / 255.0)
+    lb = rgb2lab(np.clip(out_rgb, 0, 255).astype(np.float64) / 255.0)
+    de = deltaE_ciede2000(la, lb)
+    core = (ref_c > 0.9) & (out_c > 0.9) & (w > 0)
+    return {"iou_soft": round(soft, 5), "iou_hard": round(hard, 5),
+            "edge_mean_px": e.get("mean"), "edge_p95_px": e.get("p95"),
+            "dE2000_band_mean": round(float(de[band].mean()), 3) if band.any() else None,
+            "dE2000_band_p95": round(float(np.percentile(de[band], 95)), 3) if band.any() else None,
+            "dE2000_core_mean": round(float(de[core].mean()), 3) if core.any() else None,
+            "weighted_px": int((w > 0).sum()), "hidden_px": int((w == 0).sum())}
+
+
+def composite(B: np.ndarray, ink_rgb, c: np.ndarray) -> np.ndarray:
+    I = np.asarray(ink_rgb, np.float32)[None, None, :]
+    return B + c[..., None] * (I - B)
+
+
+# ---------------------------------------------------------------- text fitting (12 October 2026)
+
+def render_line(p: dict, canvas: tuple) -> np.ndarray:
+    """Coverage of a fitted line: HarfBuzz outlines (font file, axes, size, tracking, per-glyph advance deltas, pen
+    origin on the baseline), then the measured optical softness of the reference (Gaussian blur_px)."""
+    m = R.render_text_at(p["text"], p["file"], p["size"], tuple(p["origin"]), canvas, p.get("axes") or None,
+                         p.get("tracking_em", 0.0), p.get("deltas"))
+    s = float(p.get("blur_px", 0.0))
+    return ndi.gaussian_filter(m, s) if s > 0.05 else m
+
+
+def _initial(text: str, file: str, axes: dict, c: np.ndarray, w: np.ndarray, init_mask=None) -> dict:
+    cfg = _cfg()["fit"]
+    probe = R.render_text(text, file, cfg["probe_size_px"], axes or None)
+    pb = M.ink_box(probe.mask)
+    rb = M.ink_box(c * w * (init_mask if init_mask is not None else 1.0))
+    if pb is None or rb is None:
+        raise ValueError("empty probe or reference")
+    # ink box = (top, left, bottom, right); size from the ink height, tracking from the ink width
+    size = cfg["probe_size_px"] * (rb[2] - rb[0]) / max(pb[2] - pb[0], 1)
+    probe = R.render_text(text, file, size, axes or None)
+    pb = M.ink_box(probe.mask)
+    n = max(len(text) - 1, 1)
+    tracking = ((rb[3] - rb[1]) - (pb[3] - pb[1])) / n / size
+    probe = R.render_text(text, file, size, axes or None, tracking)
+    pb = M.ink_box(probe.mask)
+    origin = [probe.origin[0] + rb[1] - pb[1], probe.origin[1] + rb[0] - pb[0]]
+    p = {"text": text, "file": file, "axes": dict(axes or {}), "size": float(size), "tracking_em": float(tracking),
+         "origin": [float(origin[0]), float(origin[1])], "blur_px": cfg["blur_start_px"], "deltas": None}
+    # 12 October 2026: the ink box can carry a stray object or miss a hidden glyph, so the size is chosen on a grid
+    # of factors around it by the weighted 2D overlap after the x alignment and a y alignment of row profiles.
+    best = None
+    H, W = c.shape
+    for f in cfg["size_factors"]:
+        q = {**p, "size": p["size"] * f}
+        q["origin"] = [q["origin"][0], q["origin"][1] * 1.0]
+        q = _align_x(q, c, w)
+        out = render_line(q, (W, H))
+        r_ref, r_out = (c * w).sum(axis=1), (out * w).sum(axis=1)
+        sy = int(np.argmax(np.correlate(r_ref, r_out, "full"))) - (H - 1)
+        q["origin"] = [q["origin"][0], q["origin"][1] + sy]
+        loss = _loss(c, render_line(q, (W, H)), w)
+        if best is None or loss < best[0]:
+            best = (loss, q)
+    return best[1]
+
+
+def _align_x(p: dict, c: np.ndarray, w: np.ndarray) -> dict:
+    """Robust horizontal start (12 October 2026): when glyphs are hidden (a bright background, a hand), the ink box
+    of the reference no longer spans the string, so origin and tracking from the box are wrong (measured on
+    Air-gap signing: the A is unreadable and the start sat one glyph to the right). Tracking on a small grid and
+    the x shift are chosen by the best weighted overlap of the column profiles."""
+    cfg = _cfg()["fit"]
+    H, W = c.shape
+    ref_cols = (c * w).sum(axis=0)
+    wcols = w.mean(axis=0)
+    best = None
+    for dt in cfg["align_tracking_grid"]:
+        q = {**p, "tracking_em": p["tracking_em"] + dt}
+        pad = W
+        out = render_line({**q, "origin": [q["origin"][0] + pad, q["origin"][1]]}, (W + 2 * pad, H))
+        cols = out.sum(axis=0)
+        for sx in range(-pad // 2, pad // 2 + 1, cfg["align_step_px"]):
+            seg = cols[pad - sx:pad - sx + W] * wcols
+            score = float(np.minimum(seg, ref_cols).sum() / max(np.maximum(seg, ref_cols).sum(), 1e-6))
+            if best is None or score > best[0]:
+                best = (score, dt, sx)
+    _, dt, sx = best
+    return {**p, "tracking_em": p["tracking_em"] + dt, "origin": [p["origin"][0] + sx, p["origin"][1]]}
+
+
+def _loss(ref: np.ndarray, out: np.ndarray, w: np.ndarray) -> float:
+    hi = float((np.maximum(ref, out) * w).sum())
+    return 1.0 - float((np.minimum(ref, out) * w).sum()) / hi if hi > 0 else 1.0
+
+
+def fit_text(text: str, file: str, c: np.ndarray, w: np.ndarray, axes: dict | None = None,
+             fit_axes: list[str] | None = None, start: dict | None = None, log=None, init_mask=None) -> dict:
+    """Multi-start wrapper (12 October 2026): without a start, the coarse stage runs from every weight of
+    vector.marks.fit.wght_starts (the placement is re-measured at that weight) and the best loss continues
+    through the full loop. Measured: a single start at wght 400 diverged to wght 900 on two captions."""
+    cfg = _cfg()["fit"]
+    ranges = {a["tag"]: (a["min"], a["max"]) for a in R.font_axes(file)}
+    if start is None and "wght" in ranges and "wght" in (fit_axes or cfg["fit_axes"]):
+        best = None
+        for w0 in cfg["wght_starts"]:
+            w0 = float(np.clip(w0, *ranges["wght"]))
+            ax = {**(axes or {}), "wght": w0}
+            p0 = _initial(text, file, ax, c, w, init_mask)
+            p0["axes"] = ax
+            q = _fit_text_once(text, file, c, w, ax, fit_axes, p0, log, coarse_only=True)
+            if best is None or q["loss"] < best["loss"]:
+                best = q
+        start = {k: v for k, v in best.items() if k not in ("fit_history", "loss")}
+    return _fit_text_once(text, file, c, w, axes, fit_axes, start, log)
+
+
+def _fit_text_once(text: str, file: str, c: np.ndarray, w: np.ndarray, axes: dict | None = None,
+                   fit_axes: list[str] | None = None, start: dict | None = None, log=None,
+                   coarse_only: bool = False) -> dict:
+    """Measured fitting loop for one line in one font file: Nelder-Mead on size, origin, tracking, blur and the
+    free axes over blurred maps (coarse to fine), then least squares on per-glyph advance deltas, alternated."""
+    cfg = _cfg()["fit"]
+    canvas = (c.shape[1], c.shape[0])
+    ranges = {a["tag"]: (a["min"], a["max"]) for a in R.font_axes(file)}
+    fit_axes = [a for a in (fit_axes or cfg["fit_axes"]) if a in ranges]
+    p = dict(start) if start else _initial(text, file, axes or {}, c, w)
+    p.setdefault("axes", {})
+    for a in fit_axes:
+        p["axes"].setdefault(a, float(np.clip(cfg["axis_start"].get(a, sum(ranges[a]) / 2), *ranges[a])))
+    keys = ["size", "ox", "oy", "tracking_em", "blur_px"] + [f"ax:{a}" for a in fit_axes]
+    unit = {"size": p["size"] * cfg["step_size_rel"], "ox": cfg["step_origin_px"], "oy": cfg["step_origin_px"],
+            "tracking_em": cfg["step_tracking_em"], "blur_px": cfg["step_blur_px"]}
+    for a in fit_axes:
+        unit[f"ax:{a}"] = (ranges[a][1] - ranges[a][0]) * cfg["step_axis_rel"]
+
+    def unpack(u, base):
+        q = {**base, "axes": dict(base["axes"]), "origin": list(base["origin"])}
+        for k, val in zip(keys, u):
+            v = val * unit[k]
+            if k == "ox":
+                q["origin"][0] = base["origin"][0] + v
+            elif k == "oy":
+                q["origin"][1] = base["origin"][1] + v
+            elif k.startswith("ax:"):
+                t = k[3:]
+                q["axes"][t] = float(np.clip(base["axes"][t] + v, *ranges[t]))
+            elif k == "blur_px":
+                # 12 October 2026: bounded, an unbounded blur buys soft IoU on a wrong placement (measured 4 px)
+                q[k] = float(np.clip(base[k] + v, 0.0, cfg["blur_max_px"]))
+            else:
+                q[k] = base[k] + v
+        return q
+
+    simplex = np.vstack([np.zeros(len(keys)), np.eye(len(keys))])
+    history = []
+    for sigma, maxfev in zip(cfg["sigmas"], cfg["nm_max_evals"]):
+        ref_s = ndi.gaussian_filter(c, sigma) if sigma > 0 else c
+        base = p
+
+        def f(u):
+            out = render_line(unpack(u, base), canvas)
+            out = ndi.gaussian_filter(out, sigma) if sigma > 0 else out
+            return _loss(ref_s, out, w)
+        # 12 October 2026: explicit simplex of one unit per parameter (scipy's default on a zero start is 0.00025)
+        r = minimize(f, np.zeros(len(keys)), method="Nelder-Mead",
+                     options={"maxfev": maxfev, "xatol": cfg["nm_xatol"], "fatol": 1e-7, "initial_simplex": simplex})
+        p = unpack(r.x, base)
+        history.append({"stage": f"nm sigma {sigma}", "loss": round(float(r.fun), 6)})
+        if coarse_only:
+            break
+    if coarse_only:
+        p["fit_history"] = history
+        p["loss"] = float(r.fun)
+        return p
+    n = len(R.shape_text(text, file, p["size"], p["axes"] or None).glyphs)
+    for rnd in range(cfg["delta_rounds"]):
+        base = p
+        d0 = np.array(base.get("deltas") or [0.0] * n, float)
+
+        # 12 October 2026: the unknowns start at 1 (not 0) because scipy's relative difference step collapses to
+        # machine epsilon at x = 0 (measured: a zero Jacobian on the rendered residual, no step taken).
+        def resid(v):
+            u = v - 1.0
+            q = {**base, "deltas": list(d0 + u * cfg["delta_unit_px"])}
+            out = render_line(q, canvas)
+            return np.concatenate([((out - c) * w).ravel(), cfg["delta_ridge"] * u])
+        r = least_squares(resid, np.ones(n), diff_step=cfg["delta_h"], max_nfev=cfg["delta_max_nfev"], method="trf")
+        p = {**base, "deltas": [round(float(x), 4) for x in d0 + (r.x - 1.0) * cfg["delta_unit_px"]]}
+        base = p
+        r2 = minimize(lambda u: _loss(c, render_line(unpack(u, base), canvas), w), np.zeros(len(keys)),
+                      method="Nelder-Mead", options={"maxfev": cfg["nm_polish_evals"], "xatol": cfg["nm_xatol"], "fatol": 1e-8,
+                                                     "initial_simplex": simplex * cfg["polish_simplex"]})
+        p = unpack(r2.x, base)
+        history.append({"stage": f"deltas round {rnd + 1}", "loss": round(float(r2.fun), 6)})
+        if log:
+            log(f"  round {rnd + 1}: loss {r2.fun:.5f}")
+    p["fit_history"] = history
+    p["loss"] = round(_loss(c, render_line(p, canvas), w), 6)
+    return p
+
+
+# ---------------------------------------------------------------- versions: cook, svg, evaluate (12 October 2026)
+
+MOTIONS = ROOT / "motions"
+
+
+def motion_dir(slug: str, mark_id: str) -> Path:
+    prefix = slug.split("-")[0]
+    return MOTIONS / f"{prefix}-f3-{mark_id}"
+
+
+def hex_rgb(h: str) -> np.ndarray:
+    h = h.lstrip("#")
+    return np.array([int(h[i:i + 2], 16) for i in (0, 2, 4)], np.float32)
+
+
+def rgb_hex(c) -> str:
+    return "#" + "".join(f"{int(round(float(np.clip(v, 0, 255)))):02x}" for v in c)
+
+
+def line_params(P: dict) -> dict:
+    """Fit parameters of a text mark version (frame coordinates). Raises with the name of a missing parameter."""
+    need = ("text", "font", "size_px", "tracking_em", "origin_px", "blur_px", "colour", "canvas")
+    miss = [k for k in need if k not in P]
+    if miss:
+        raise KeyError(f"text mark params missing {miss}")
+    return {"text": P["text"], "file": P["font"]["file"], "axes": P["font"].get("axes") or {}, "size": P["size_px"],
+            "tracking_em": P["tracking_em"], "origin": P["origin_px"], "blur_px": P["blur_px"],
+            "deltas": P.get("deltas_px")}
+
+
+def cook_text(P: dict) -> np.ndarray:
+    """RGBA render of a text mark version on its canvas (transparent background), from params alone."""
+    W, H = P["canvas"]
+    c = render_line(line_params(P), (W, H))
+    rgba = np.zeros((H, W, 4), np.uint8)
+    rgba[..., :3] = np.clip(column_colours(P, W)[None, :, :] + 0.5, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip(c * float(P.get("opacity", 1.0)) * 255 + 0.5, 0, 255).astype(np.uint8)
+    return rgba
+
+
+def column_colours(P: dict, W: int) -> np.ndarray:
+    """Colour of every canvas column: colour times the lightmap gain interpolated along x (12 October 2026).
+    lightmap = {"x_px": [...], "gain": [...]} in canvas pixels; absent or empty means a flat colour."""
+    base = hex_rgb(P["colour"])
+    lm = P.get("lightmap") or {}
+    if not lm.get("x_px"):
+        return np.tile(base, (W, 1))
+    g = np.interp(np.arange(W), lm["x_px"], lm["gain"])
+    return np.clip(base[None, :] * g[:, None], 0, 255)
+
+
+def text_svg(P: dict) -> str:
+    """Editable SVG of a text mark: one <g id="line"> with one named <path> per glyph (font outlines at the fitted
+    size and axes, positions with tracking and per-glyph deltas), the optical blur as a named filter, the colour and
+    the parameters in <metadata>. 12 October 2026."""
+    lp = line_params(P)
+    o = R.shape_text(lp["text"], lp["file"], lp["size"], lp["axes"] or None, lp["tracking_em"], True, lp["deltas"])
+    W, H = P["canvas"]
+    x0, y0 = lp["origin"][0], lp["origin"][1] - o.ascender_px
+    blur = float(P["blur_px"])
+    rows = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">',
+            f"<metadata>{json.dumps({k: v for k, v in P.items() if k != 'fit_history'}, ensure_ascii=False)}</metadata>",
+            f'<defs><filter id="optical-blur" x="-10%" y="-50%" width="120%" height="200%">'
+            f'<feGaussianBlur stdDeviation="{blur:g}"/></filter>{_lightmap_svg(P)}</defs>',
+            f'<g id="line" fill="{"url(#lightmap)" if (P.get("lightmap") or {}).get("x_px") else P["colour"]}"'
+            f' fill-opacity="{float(P.get("opacity", 1.0)):g}"'
+            f'{" filter=" + chr(34) + "url(#optical-blur)" + chr(34) if blur > 0.05 else ""} transform="translate({x0:g} {y0:g})">']
+    for i, g in enumerate(o.glyphs):
+        if g["path"]:
+            rows.append(f'<path id="g{i:03d}-{g["name"]}" data-advance="{g["advance"]}" d="{g["path"]}"/>')
+    rows += ["</g>", "</svg>"]
+    return "\n".join(rows)
+
+
+def _lightmap_svg(P: dict) -> str:
+    """The lightmap as a horizontal linearGradient in canvas units (12 October 2026)."""
+    lm = P.get("lightmap") or {}
+    if not lm.get("x_px"):
+        return ""
+    base = hex_rgb(P["colour"])
+    x0, x1 = lm["x_px"][0], lm["x_px"][-1]
+    span = max(x1 - x0, 1e-6)
+    stops = "".join(f'<stop offset="{(x - x0) / span:.5f}" stop-color="{rgb_hex(base * g)}"/>'
+                    for x, g in zip(lm["x_px"], lm["gain"]))
+    return f'<linearGradient id="lightmap" gradientUnits="userSpaceOnUse" x1="{x0:g}" y1="0" x2="{x1:g}" y2="0">{stops}</linearGradient>'
+
+
+def lightmap_from_ref(ref: dict) -> tuple[str, dict]:
+    """Base colour (brightest bin) and gains along x in canvas pixels from the measured ink line."""
+    li = ref["ink_line"]
+    cols = np.array(li["colours"], float)
+    lum = cols.mean(axis=1)
+    k = int(np.argmax(lum))
+    gains = (lum / max(lum[k], 1e-6)).round(4).tolist()
+    xs = [round(x + ref["offset"][0], 2) for x in li["centres"]]
+    return rgb_hex(cols[k]), {"x_px": xs, "gain": gains}
+
+
+def reference_of(slug: str, mark: dict) -> dict:
+    """Reference measures of a mark (analysis only): crop rgb, coverage, weight, background, ink colour, crop box."""
+    d = mark_cache(slug, mark["id"])
+    rgb = np.asarray(Image.open(d / "crop.png").convert("RGB")).astype(np.float32)
+    cv = coverage(rgb, mark.get("occluders"))
+    cc = _cfg()["coverage"]
+    keep, _ = line_components(cv["c"], cc["band_frac"], cc["extent_tol"], cc["max_width_band"], cc["min_thick_frac"],
+                             cc["max_gap_band"])
+    ys, xs = np.nonzero(keep)
+    m_ = cc["crop_margin_px"]
+    H, W = keep.shape
+    t, l, b, r = max(0, ys.min() - m_), max(0, xs.min() - m_), min(H, ys.max() + 1 + m_), min(W, xs.max() + 1 + m_)
+    rgb_c, B_c, keep_c = rgb[t:b, l:r], cv["B"][t:b, l:r], keep[t:b, l:r]
+    # 12 October 2026: ink colour along the line (shine, two-tone words), then coverage against that local ink.
+    li = local_ink(rgb_c, B_c, keep_c, cc["ink_bin_px"], cc["ink_core_percentile"])
+    v = li["column_rgb"][None, :, :] - B_c
+    c = np.clip(((rgb_c - B_c) * v).sum(axis=2) / np.maximum((v * v).sum(axis=2), 1e-3), 0.0, 1.0)
+    # noise floor of the matting, measured on pixels far from the ink (codec noise, glow); the coverage is rescaled
+    # above it so a flat background reads 0 and not a faint haze.
+    far = ndi.distance_transform_edt(c < 0.5) > cc["noise_floor_distance_px"]
+    floor = float(np.percentile(c[far], cc["noise_floor_percentile"])) if far.any() else 0.0
+    c = np.clip((c - floor) / max(1.0 - floor, 1e-3), 0.0, 1.0)
+    weight = cv["weight"][t:b, l:r].copy()
+    # ink that is not part of the line (streaks, objects) is hidden, never fitted
+    near = ndi.binary_dilation(keep_c, iterations=cc["stray_gap_px"])
+    stray = ndi.binary_dilation((c > cc["stray_level"]) & ~near, iterations=cc["occluder_dilate_px"])
+    weight[stray] = 0.0
+    info = json.loads((d / "frame.json").read_text())
+    return {"rgb": rgb_c, "c": c.astype(np.float32), "weight": weight, "B": B_c, "ink": cv["I"], "keep": keep_c,
+            "ink_line": li, "box": (t, l, b, r), "offset": (mark["region"][0] + l, mark["region"][1] + t),
+            "time_s": info["time_s"], "noise_floor": round(floor, 4)}
+
+
+def evaluate_rgba(rgba: np.ndarray, ref: dict) -> dict:
+    """Fidelity of a cooked RGBA (full canvas) against the reference crop."""
+    ox, oy = ref["offset"]
+    h, w = ref["c"].shape
+    sub = rgba[oy:oy + h, ox:ox + w].astype(np.float32)
+    out_c = sub[..., 3] / 255.0
+    out_rgb = ref["B"] + out_c[..., None] * (sub[..., :3] - ref["B"])   # cooked colour per pixel (lightmap)
+    f = fidelity(ref["c"], out_c, ref["weight"], ref["rgb"], out_rgb)
+    rule = _cfg()["match"]
+    f["match"] = bool(f["iou_soft"] >= rule["iou_min"] and (f["edge_mean_px"] or 0) <= rule["edge_mean_max_px"])
+    return f
+
+
+def svg_fidelity(ref_rgb: np.ndarray, out_rgb: np.ndarray) -> dict:
+    """F3 measures of a traced mark on its crop canvas: both images read as coverage with the reference's own
+    background and ink (so the same matting judges both), then mask IoU, edge distance and dE2000. 12 October 2026."""
+    cv = coverage(ref_rgb)
+    v = cv["I"][None, None, :] - cv["B"]
+    den = np.maximum((v * v).sum(axis=2), 1e-3)
+    c_out = np.clip(((out_rgb - cv["B"]) * v).sum(axis=2) / den, 0.0, 1.0)
+    f = fidelity(cv["c"], c_out, np.ones_like(cv["c"]), ref_rgb, out_rgb)
+    rule = _cfg()["match"]
+    f["match"] = bool(f["iou_soft"] >= rule["iou_min"] and (f["edge_mean_px"] or 0) <= rule["edge_mean_max_px"])
+    return f

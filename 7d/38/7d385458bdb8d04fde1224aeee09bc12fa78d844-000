@@ -1,0 +1,148 @@
+# 12 October 2026, 03:10 CEST: versioned motion instances, V_001 to V_999 (HDA: a version never overwrites another).
+# A motion folder holds motion.json (identity) and one folder per version; each version starts from its parent's
+# parameters plus explicit overrides, so every change is a new, comparable instance.
+from __future__ import annotations
+
+import copy
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+VERSION_RE = re.compile(r"^V_(\d{3})$")
+MAX_VERSION = 999
+
+
+def today() -> str:
+    """Date in the house format: 12 October 2026."""
+    now = datetime.now(ZoneInfo("Europe/Paris"))
+    return f"{now.day} {now.strftime('%B %Y')}"
+
+
+def stamp() -> str:
+    now = datetime.now(ZoneInfo("Europe/Paris"))
+    return f"{now.day} {now.strftime('%B %Y')}, {now.strftime('%H:%M')}"
+
+
+def version_name(number: int) -> str:
+    if not 1 <= number <= MAX_VERSION:
+        raise ValueError(f"version number {number} outside 1..{MAX_VERSION}")
+    return f"V_{number:03d}"
+
+
+def list_versions(motion_dir: str | Path) -> list[str]:
+    motion_dir = Path(motion_dir)
+    if not motion_dir.exists():
+        return []
+    names = [p.name for p in motion_dir.iterdir() if p.is_dir() and VERSION_RE.match(p.name)]
+    return sorted(names, key=lambda n: int(VERSION_RE.match(n).group(1)))
+
+
+def latest_version(motion_dir: str | Path) -> str | None:
+    versions = list_versions(motion_dir)
+    return versions[-1] if versions else None
+
+
+def next_version(motion_dir: str | Path) -> str:
+    latest = latest_version(motion_dir)
+    number = int(VERSION_RE.match(latest).group(1)) + 1 if latest else 1
+    if number > MAX_VERSION:
+        raise RuntimeError(f"{motion_dir} already has {MAX_VERSION} versions; start a new motion id")
+    return version_name(number)
+
+
+def deep_merge(base: dict, overrides: dict) -> dict:
+    """Overrides win; nested dicts merge; a None value deletes the key."""
+    result = copy.deepcopy(base)
+    for key, value in (overrides or {}).items():
+        if value is None:
+            result.pop(key, None)
+        elif isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _list_index(node: list, part: str) -> int:
+    """12 October 2026: a list segment is an integer, or '@<id>' for the element whose 'id' is <id> (stable across
+    layer reordering, used by the exposed parameters of the site)."""
+    if part.startswith("@"):
+        for i, item in enumerate(node):
+            if isinstance(item, dict) and item.get("id") == part[1:]:
+                return i
+        raise KeyError(f"no element with id {part[1:]!r}")
+    return int(part)
+
+
+def set_path(params: dict, dotted: str, value) -> dict:
+    """Set params['a']['b'] from 'a.b' (lists accept integer segments, or '@id' since 12 October 2026)."""
+    node = params
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        key = _list_index(node, part) if isinstance(node, list) else part
+        if isinstance(node, dict) and key not in node:
+            node[key] = {}
+        node = node[key]
+    last = parts[-1]
+    if isinstance(node, list):
+        node[_list_index(node, last)] = value
+    else:
+        node[last] = value
+    return params
+
+
+def get_path(params, dotted: str, default=None):
+    """12 October 2026: read params['a']['b'] from 'a.b' with the same segment rules as set_path; default when absent."""
+    node = params
+    try:
+        for part in dotted.split("."):
+            node = node[_list_index(node, part)] if isinstance(node, list) else node[part]
+    except (KeyError, IndexError, ValueError, TypeError):
+        return default
+    return node
+
+
+def read_json(path: str | Path, default=None):
+    path = Path(path)
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: str | Path, data) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def create_version(motion_dir: str | Path, params: dict | None = None, *, parent: str | None = None,
+                   overrides: dict | None = None, note: str = "", author: str = "zrmd") -> Path:
+    """Create the next version folder. Starts from `params`, else from the parent's (or latest) params."""
+    motion_dir = Path(motion_dir)
+    name = next_version(motion_dir)
+    parent = parent or latest_version(motion_dir)
+    if params is None:
+        if not parent:
+            raise ValueError("first version needs explicit params")
+        params = read_json(motion_dir / parent / "params.json")
+        if params is None:
+            raise FileNotFoundError(f"{motion_dir / parent / 'params.json'} missing")
+    params = deep_merge(params, overrides or {})
+    folder = motion_dir / name
+    folder.mkdir(parents=True, exist_ok=False)
+    write_json(folder / "params.json", params)
+    write_json(folder / "version.json", {"version": name, "parent": parent, "created": stamp(), "note": note,
+                                         "author": author, "overrides": overrides or {}})
+    motion = read_json(motion_dir / "motion.json", {}) or {}
+    motion["latest"] = name
+    motion.setdefault("versions", [])
+    if name not in motion["versions"]:
+        motion["versions"].append(name)
+    motion["updated"] = today()
+    write_json(motion_dir / "motion.json", motion)
+    return folder

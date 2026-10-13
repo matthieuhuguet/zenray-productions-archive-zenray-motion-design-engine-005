@@ -1,0 +1,216 @@
+# 12 October 2026, 11:20 CEST: rebuild a caption shot (text group on a flat background) from measurements.
+# Measured, never copied: background colour, x-height, stroke density (font weight), width per letter (tracking),
+# position of the x band, and per-frame scale and brightness curves fitted as editable tweens. The words are a
+# parameter: by default an original phrase; the reference words are only read (OCR) to calibrate tracking.
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+from .. import settings
+from ..analyze import curves, layers, typography as ty
+from ..analyze.effects import fit_band_map
+from ..media import frame_at, probe
+
+
+def ocr_line(gray_crop: np.ndarray) -> str:
+    """Tesseract on a measurement crop, used only to calibrate letter spacing (never emitted)."""
+    from PIL import Image
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "line.png"
+        Image.fromarray((255 - np.clip(gray_crop * 255, 0, 255)).astype(np.uint8)).save(path)
+        out = subprocess.run(["tesseract", str(path), "-", "--psm", "7"], capture_output=True, text=True).stdout
+    return " ".join(out.split())
+
+
+def measure_sweep(video: str, start: float, end: float, box, bg, fps: float, min_excess: float = 15.0) -> dict | None:
+    """A highlight band travelling across the text: per frame, the brightness excess over the text's base level
+    per column; its weighted centre and spread give the band path. None when no band is found."""
+    from ..media import read_frames
+    x0, y0, x1, y1 = box
+    frames = read_frames(video, 1920, 1080, gray=True, start=start, duration=end - start).astype(np.float32)[:, y0:y1, x0:x1]
+    level = float(np.abs(bg).mean())
+    ink = np.abs(frames - level) > 40
+    base = np.median([frames[i][ink[i]].mean() for i in range(len(frames)) if ink[i].any()])
+    path = []
+    for i in range(len(frames)):
+        m = ink[i]
+        if not m.any():
+            continue
+        col_sum = (np.where(m, frames[i], 0)).sum(axis=0); col_n = m.sum(axis=0)
+        cols = np.where(col_n > 0, col_sum / np.maximum(col_n, 1), base) - base
+        excess = np.convolve(np.clip(cols, 0, None), np.ones(41) / 41, mode="same")
+        if excess.max() < min_excess:
+            continue
+        core = excess >= 0.5 * excess.max()
+        xs = np.arange(len(excess))
+        wsum = excess[core].sum()
+        c = float((xs[core] * excess[core]).sum() / wsum)
+        sd = float(core.sum() / 2.0)
+        path.append({"t": round(start + i / fps, 4), "center_px": round(c + x0, 1), "spread_px": round(sd, 1),
+                     "peak": round(float(excess.max()), 1)})
+    if len(path) < 4:
+        return None
+    return {"base_level": round(float(base), 1), "peak_excess": max(p["peak"] for p in path), "path": path,
+            "text_left": x0, "text_right": x1}
+
+
+def measure(video: str, start: float, end: float) -> dict:
+    cfg = settings.get("analysis.layers"); cfg["group"] = True
+    shot = layers.analyze_shot(video, start, end, cfg)
+    if not shot["elements"]:
+        raise ValueError("no text group found in shot")
+    track = max(shot["elements"], key=lambda e: e["peak_ink"])
+    info = probe(video)
+    W, H = info["width"], info["height"]
+    scale = shot["scale_to_source"]
+    # Geometry and metrics come from the most lit frame (a caption can fade out before its cut).
+    settle = max(track["frames"], key=lambda f: f.get("mass", f["ink"]))
+    x, y, w, h = settle["box_full"]
+    pad = 40
+    y0, y1 = int(max(0, y - pad)), int(min(H, y + h + pad))
+    x0, x1 = int(max(0, x - pad)), int(min(W, x + w + pad))
+    full = frame_at(video, settle["t"], W, H).astype(np.float32)
+    bg = np.array(shot["background"][-1], np.float32)
+    ink = np.abs(full - bg).max(axis=2) / 255.0
+    crop = ink[y0:y1, x0:x1]
+    metrics = ty.line_metrics(crop / max(crop.max(), 1e-6))
+    text = ocr_line(crop / max(crop.max(), 1e-6))
+    # Ink colour from the stroke cores (no antialiasing) and stroke thickness, at the most lit frame.
+    lit = max(track["frames"], key=lambda f: f.get("mass", f["ink"]))
+    lit_full = frame_at(video, lit["t"], W, H).astype(np.float32)
+    lit_ink = np.abs(lit_full - bg).max(axis=2) / 255.0
+    lit_crop = lit_ink[y0:y1, x0:x1]
+    core = ty.core_colour(lit_full[y0:y1, x0:x1], lit_crop / max(lit_crop.max(), 1e-6))
+    stroke = ty.stroke_width(lit_crop / max(lit_crop.max(), 1e-6))
+    color = full[y0:y1, x0:x1][crop > 0.6 * crop.max()]
+    t = np.array([f["t"] for f in track["frames"]])
+    sy = np.array([f["sy"] for f in track["frames"]])
+    bright = np.array([f["color"][0] + f["color"][1] + f["color"][2] for f in track["frames"]]) / 3.0
+    from ..verify.fidelity import brightness_map as _bmap
+    from ..analyze.effects import light_map as _light
+    light = _light(_bmap(video, start, end - start))
+    if light.get("ok"):
+        light = {"level": light["level"], "rel": light["rel"].tolist(), "plateau_frames": light["plateau_frames"]}
+    else:
+        light = None
+    sweep = measure_sweep(video, start, end, (x0, y0, x1, y1), bg, info["fps"])
+    if sweep:
+        from ..verify.fidelity import brightness_map
+        bmap = brightness_map(video, start, end - start)
+        settled = np.nanmedian(bmap[-max(1, len(bmap) // 5):], axis=0)
+        # Each bin is divided by its settled value: letter shapes cancel, a global gain and a moving band remain.
+        rel = bmap / settled
+        gain = np.nanmedian(np.where(rel <= np.nanpercentile(rel, 60, axis=1, keepdims=True), rel, np.nan), axis=1)
+        resid = rel - gain[:, None]
+        base = float(np.nanmedian(settled))
+        peak_rel = float(np.nanmax(resid))
+        from ..analyze.effects import fit_sweep
+        sweep["global"] = fit_sweep(resid, info["fps"])
+        sweep["map_fit"] = {"base": round(base, 2), "peak": round(min(255.0, base * (1 + peak_rel)), 2),
+                            "gain": [round(float(g), 4) for g in gain],
+                            "frames": fit_band_map(resid * base + base, base, base * (1 + peak_rel))}
+    return {"start": start, "end": end, "fps": info["fps"], "width": W, "height": H, "sweep": sweep, "light": light,
+            "background": [float(c) for c in np.median(shot["background"], axis=0)],
+            "text_color": core if core else ([float(c) for c in np.percentile(color, 95, axis=0)] if len(color) else [255.0] * 3),
+            "stroke_px": stroke, "lit_t": lit["t"],
+            "x_band_center": [float(x0 + (crop.shape[1] / 2)), float(y0 + (metrics["x_top"] + metrics["baseline"]) / 2)],
+            "ink_center_x": float(settle["cx"] * scale), "box_center_x": float((settle["box"][0] + settle["box"][2] / 2.0) * scale),
+            "metrics": metrics, "ocr": text,
+            "track": {"t": t.tolist(), "sy": sy.tolist(), "bright": bright.tolist(),
+                      "cx": [f["cx"] * scale for f in track["frames"]], "cy": [f["cy"] * scale for f in track["frames"]],
+                      "bx": [(f["box"][0] + f["box"][2] / 2.0) * scale for f in track["frames"]],
+                      "mass": [f.get("mass", f["ink"]) for f in track["frames"]]}}
+
+
+def build_params(m: dict, words: str, font_file: str, family: str = "ZrInter") -> dict:
+    fps = m["fps"]
+    frames = int(round((m["end"] - m["start"]) * fps))
+    met = m["metrics"]
+    match = ty.match_weight(met["stroke_density"], m["ocr"] or words, font_file, met["x_height"])
+    if not match or "size" not in match:
+        match = {"weight": 400, "size": ty.size_for_x_height(m["ocr"] or words, font_file, met["x_height"], 400)}
+    size, weight = match["size"], match["weight"]
+    # Tracking from the reference words' width (measurement only), applied to whatever words are emitted.
+    tracking = 0.0
+    if m["ocr"]:
+        plain = ty.line_metrics(ty.render_line(m["ocr"], font_file, size, weight))
+        gaps = max(len(m["ocr"]) - 1, 1)
+        if plain and abs(plain["width"] - met["width"]) / met["width"] < 0.4:
+            tracking = round((met["width"] - plain["width"]) / gaps / size, 4)
+    t = np.array(m["track"]["t"]) - m["start"]
+    sy = np.array(m["track"]["sy"]); scale_curve = sy / sy[-1]
+    bright = np.array(m["track"]["bright"]); bright_curve = bright / max(bright[-1], 1e-6)
+    tweens_scale = [{"start_frame": int(round(tw["start"] * fps)), "frames": max(1, int(round(tw["duration"] * fps))),
+                     "from": round(tw["from"], 4), "to": round(tw["to"], 4), "ease": tw["ease"]}
+                    for tw in curves.fit_track(t, scale_curve)]
+    tweens_bright = [{"start_frame": int(round(tw["start"] * fps)), "frames": max(1, int(round(tw["duration"] * fps))),
+                      "from": round(tw["from"], 4), "to": round(tw["to"], 4), "ease": tw["ease"]}
+                     for tw in curves.fit_track(t, bright_curve)]
+    color = "#%02x%02x%02x" % tuple(int(round(c)) for c in m["text_color"])
+    bgc = "#%02x%02x%02x" % tuple(int(round(c)) for c in m["background"])
+    # Centred captions align on their box centre; the ink centroid depends on the letters written.
+    cx, cy = m.get("box_center_x", m["ink_center_x"]), m["x_band_center"][1]
+    first_scale = tweens_scale[0]["from"] if tweens_scale else 1.0
+    first_bright = tweens_bright[0]["from"] if tweens_bright else 1.0
+    tracks = {"scale": tweens_scale, "brightness": tweens_bright}
+    shine = None
+    sweep = m.get("sweep")
+    if sweep:
+        # One editable sweep gesture fitted globally (zrmd.analyze.effects.fit_sweep): start, end, from, to,
+        # half width, strength, ease power. Strength is folded into the highlight colour.
+        sw = sweep["global"]
+        f0, f1 = int(round(sw["t0"] * fps)), int(round(sw["t1"] * fps))
+        ease = "power1.inOut" if sw["power"] < 1.5 else ("power2.inOut" if sw["power"] < 2.5 else "power3.inOut")
+        if sw["power"] < 1.2:
+            ease = "none"
+        tracks["shine"] = [{"start_frame": max(0, f0), "frames": max(1, f1 - f0), "from": round(sw["c0"], 2), "to": round(sw["c1"], 2), "ease": ease}]
+        tracks["shineW"] = [{"start_frame": 0, "frames": 1, "from": round(sw["w"], 2), "to": round(sw["w"], 2), "ease": "none"}]
+        tracks["shineA"] = [{"start_frame": 0, "frames": 1, "from": 1.0, "to": 1.0, "ease": "none"}]
+        base_level = sweep["map_fit"]["base"]
+        shine = {"base": "#%02x%02x%02x" % ((int(round(base_level)),) * 3),
+                 "highlight": "#%02x%02x%02x" % ((int(round(min(255.0, base_level * (1 + sw["amp"])))),) * 3),
+                 "gesture": {k: round(v, 4) for k, v in sw.items()}}
+        g = np.array(fit["gain"]) if (fit := sweep["map_fit"]) else np.array([])
+        if len(g):
+            gt = np.arange(len(g)) / fps
+            tracks["brightness"] = [{"start_frame": int(round(tw["start"] * fps)), "frames": max(1, int(round(tw["duration"] * fps))),
+                                     "from": round(tw["from"], 4), "to": round(tw["to"], 4), "ease": tw["ease"]}
+                                    for tw in curves.fit_track(gt[~np.isnan(g)], g[~np.isnan(g)], rel_eps=0.01)]
+    # Light on text as measured data (zrmd.analyze.effects.light_map): exact by construction, words cancel out.
+    lightmap = None
+    if m.get("light"):
+        rel = np.array(m["light"]["rel"])
+        peak = float(rel.max()) if rel.size else 1.0
+        plateau_color = np.array(m["text_color"], float)
+        base_rgb = plateau_color * min(1.0, 255.0 / max(peak * plateau_color.max(), 1e-6))
+        lightmap = {"bins": int(rel.shape[1]), "start_frame": 0, "base": [round(float(c), 2) for c in base_rgb],
+                    "gain": 1.0,
+                    "rel": np.round(rel, 3).tolist()}
+        tracks.pop("brightness", None); tracks.pop("shine", None); tracks.pop("shineW", None); tracks.pop("shineA", None)
+        shine = None
+    return {
+        "schema": "zrmd/motion@1",
+        "canvas": {"width": m["width"], "height": m["height"], "fps": fps, "frames": frames},
+        "fonts": [{"family": family, "file": font_file}],
+        "measured": {"x_height": met["x_height"], "stroke_density": met["stroke_density"], "weight": weight,
+                     "size": size, "tracking_em": tracking, "reference_width": met["width"]},
+        "layers": [
+            {"id": "bg", "type": "solid", "color": bgc, "z": 0},
+            {"id": "caption", "type": "text", "text": words, "color": color, "x": round(cx, 2), "y": round(cy, 2),
+             "anchor": [0.5, 0.5], "z": 2, "font": {"family": family, "weight": weight, "size": size, "tracking": tracking,
+                                                     "variation": f"'wght' {weight}, 'opsz' 32"},
+             "initial": {"brightness": 1.0 if (shine or lightmap) else first_bright}, "base_scale": first_scale,
+             "shine": shine, "lightmap": lightmap, "tracks": tracks},
+        ],
+    }
+
+
+def save(path: str | Path, data: dict) -> Path:
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path

@@ -1,0 +1,235 @@
+# 12 October 2026: the procedural shader bank (datasets/shaders), the image counterpart of the zenray-height block
+# dataset. Each block is a pure GLSL ES 3.0 function plus a numpy twin with the same formula: the twin is used to
+# fit parameters to a measured reference, the GLSL is what renders, sharp at any resolution. No reference pixel is
+# ever used as a texture.
+#
+# Block contract (see datasets/shaders/README.md):
+#   block.glsl  defines  vec4 <id>(vec2 uv, <params in block.json order>), uv = pixel centre in [0,1]^2, v downwards,
+#               returns straight RGBA 0..1 (mask blocks: (1, 1, 1, m); colour blocks: alpha 1). Helpers are prefixed <id>_.
+#   twin.py     defines  render(params, u, v) -> HxWx3 float 0..255 (colour) or HxW float 0..1 (mask).
+#   block.json  {id, family, description, params:[{name, type, default, min, max, unit}], source_url, licence,
+#                attribution, tags, looks}. Types: float, vec2, vec3, color (vec3, sRGB 0..1).
+# FR : la banque de shaders procéduraux ; chaque bloc est une fonction GLSL pure et son jumeau numpy.
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import tempfile
+from datetime import date
+from pathlib import Path
+
+import numpy as np
+
+from .. import render as zrender
+from .. import settings
+
+PARAM_SIZES = {"float": 1, "vec2": 2, "vec3": 3, "color": 3}
+
+
+def root() -> Path:
+    # 12 October 2026: ZRMD_SHADER_BANK overrides the bank folder (used by the verifier's red test on a copy).
+    override = os.environ.get("ZRMD_SHADER_BANK")
+    return Path(override) if override else Path(settings.get("shaders.bank"))
+
+
+def list_blocks() -> list[str]:
+    # 12 October 2026: the folders are the truth; index.json is rebuilt from them by rebuild_index().
+    r = root()
+    return sorted(p.parent.name for p in r.glob("*/block.json"))
+
+
+_cache: dict = {}
+
+
+def load(block_id: str) -> dict:
+    # 12 October 2026: {id, meta, glsl, twin, path}; cached on the files' modification times so an edited twin is seen.
+    d = root() / block_id
+    files = [d / "block.json", d / "block.glsl", d / "twin.py"]
+    for f in files:
+        if not f.exists():
+            raise FileNotFoundError(f"shader block '{block_id}' is missing {f}")
+    key = (str(d), tuple(f.stat().st_mtime_ns for f in files))
+    if key in _cache:
+        return _cache[key]
+    meta = json.loads(files[0].read_text(encoding="utf-8"))
+    if meta.get("id") != block_id:
+        raise ValueError(f"{files[0]}: id '{meta.get('id')}' differs from folder '{block_id}'")
+    for p in meta["params"]:
+        if p["type"] not in PARAM_SIZES:
+            raise ValueError(f"{block_id}.{p['name']}: unknown type {p['type']}")
+    spec = importlib.util.spec_from_file_location(f"zrmd_shader_twin_{block_id}_{key[1][2]}", files[2])
+    mod = importlib.util.module_from_spec(spec)
+    import sys
+    keep, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # 12 October 2026: no __pycache__ inside the dataset.
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = keep
+    block = {"id": block_id, "meta": meta, "glsl": files[1].read_text(encoding="utf-8"), "twin": mod.render, "path": d}
+    _cache[key] = block
+    return block
+
+
+def resolve_params(meta: dict, params: dict | None) -> dict:
+    # 12 October 2026: defaults filled in, unknown names and wrong sizes raise (a parameter never passes silently).
+    params = dict(params or {})
+    known = {p["name"] for p in meta["params"]}
+    unknown = set(params) - known
+    if unknown:
+        raise KeyError(f"{meta['id']}: unknown params {sorted(unknown)}")
+    out = {}
+    for p in meta["params"]:
+        val = params.get(p["name"], p["default"])
+        n = PARAM_SIZES[p["type"]]
+        if n == 1:
+            val = float(val)
+        else:
+            val = [float(x) for x in val]
+            if len(val) != n:
+                raise ValueError(f"{meta['id']}.{p['name']}: expected {n} values, got {len(val)}")
+        out[p["name"]] = val
+    return out
+
+
+def random_params(meta: dict, rng: np.random.Generator) -> dict:
+    # 12 October 2026: one uniform draw inside [min, max] for every parameter (per component for vectors).
+    out = {}
+    for p in meta["params"]:
+        lo, hi = np.asarray(p["min"], dtype=float), np.asarray(p["max"], dtype=float)
+        val = lo + (hi - lo) * rng.random(lo.shape)
+        out[p["name"]] = float(val) if PARAM_SIZES[p["type"]] == 1 else [float(x) for x in val]
+    return out
+
+
+def uv_grid(w: int, h: int) -> tuple[np.ndarray, np.ndarray]:
+    # 12 October 2026: pixel centres, identical to the GLSL uv (gl_FragCoord with v flipped to point down).
+    u = (np.arange(w) + 0.5) / w
+    v = (np.arange(h) + 0.5) / h
+    return np.meshgrid(u, v)
+
+
+def twin_rgba(block_id: str, params: dict, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    # 12 October 2026: twin output normalised to straight RGBA 0..1, the same convention as the GLSL return value.
+    b = load(block_id)
+    out = np.asarray(b["twin"](resolve_params(b["meta"], params), u, v), dtype=float)
+    if out.ndim == 2:
+        rgba = np.ones(out.shape + (4,))
+        rgba[..., 3] = out
+        return rgba
+    if out.ndim == 3 and out.shape[2] == 3:
+        return np.concatenate([out / 255.0, np.ones(out.shape[:2] + (1,))], axis=2)
+    raise ValueError(f"{block_id} twin returned shape {out.shape}, expected HxW or HxWx3")
+
+
+def render_twin(block_id: str, params: dict | None, w: int, h: int) -> np.ndarray:
+    # 12 October 2026: one block alone over black, HxWx3 float 0..255, exactly what render_glsl draws for it.
+    from . import compose
+    return compose.evaluate([{"block": block_id, "params": params or {}}], w, h)
+
+
+def _page(sources: list[str], cases: list[dict], w: int, h: int, fps: int) -> str:
+    # 12 October 2026: raw WebGL2 page, one fullscreen triangle; case i is shown at time i / fps (HyperFrames seek).
+    # A shader that fails to compile paints magenta, so the verifier turns red instead of passing on a stale frame.
+    dur = (len(cases) + 1) / fps
+    data = json.dumps({"sources": sources, "cases": cases, "fps": fps}, separators=(",", ":"))
+    return f"""<!doctype html>
+<!-- Cooked by zrmd.shaders.bank (12 October 2026); never edit by hand. -->
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width={w}, height={h}">
+<style>html, body {{ margin: 0; padding: 0; background: #000; }} #stage {{ width: {w}px; height: {h}px; display: block; }}</style>
+</head><body>
+<div id="root" data-composition-id="main" data-start="0" data-duration="{dur:.6f}" data-width="{w}" data-height="{h}" data-fps="{fps}" data-no-timeline>
+  <canvas id="stage" width="{w}" height="{h}"></canvas>
+</div>
+<script>
+const ZR = {data};
+const gl = document.getElementById("stage").getContext("webgl2", {{ preserveDrawingBuffer: true, antialias: false, premultipliedAlpha: false }});
+const VS = "#version 300 es\\nin vec2 p; void main() {{ gl_Position = vec4(p, 0.0, 1.0); }}";
+function compile(type, src) {{ const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {{ console.error(gl.getShaderInfoLog(s)); return null; }} return s; }}
+const programs = ZR.sources.map((src) => {{ const v = compile(gl.VERTEX_SHADER, VS), f = compile(gl.FRAGMENT_SHADER, src);
+  if (!v || !f) return null; const p = gl.createProgram(); gl.attachShader(p, v); gl.attachShader(p, f); gl.bindAttribLocation(p, 0, "p"); gl.linkProgram(p);
+  return gl.getProgramParameter(p, gl.LINK_STATUS) ? p : null; }});
+const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.viewport(0, 0, {w}, {h});
+function renderAt(t) {{
+  const i = Math.max(0, Math.min(ZR.cases.length - 1, Math.round(t * ZR.fps))), c = ZR.cases[i], p = programs[c.prog];
+  if (!p) {{ gl.clearColor(1, 0, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT); return; }}
+  gl.useProgram(p);
+  gl.uniform2f(gl.getUniformLocation(p, "u_resolution"), {w}, {h});
+  for (const u of c.uniforms) {{ const loc = gl.getUniformLocation(p, u.name); const val = [].concat(u.value);
+    if (u.type === "float") gl.uniform1f(loc, val[0]); else if (u.type === "vec2") gl.uniform2fv(loc, val); else gl.uniform3fv(loc, val); }}
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}}
+window.__hf = window.__hf || {{}};
+window.__hf.buildReady = window.__hf.buildReady || {{}};
+window.__hf.buildReady["zr-shader"] = Promise.resolve();
+window.addEventListener("hf-seek", (e) => renderAt(e.detail.time));
+renderAt(0);
+</script></body></html>
+"""
+
+
+def render_glsl_batch(compositions: list, w: int, h: int) -> list[np.ndarray]:
+    # 12 October 2026: many compositions in ONE HyperFrames snapshot run (one browser launch, a few seconds).
+    # Each item is a layer list for compose (or a single (id, params) pair). Returns HxWx3 uint8 arrays, in order.
+    from PIL import Image
+
+    from . import compose
+    sources, cases = [], []
+    for comp in compositions:
+        if isinstance(comp, tuple) and isinstance(comp[0], str):
+            comp = [comp]
+        src, uniforms = compose.emit_glsl(comp)
+        if src not in sources:
+            sources.append(src)
+        cases.append({"prog": sources.index(src), "uniforms": uniforms})
+    fps = int(settings.get("shaders.still_fps"))
+    work = Path(tempfile.mkdtemp(prefix="zrmd-shader-"))
+    try:
+        (work / "index.html").write_text(_page(sources, cases, w, h, fps), encoding="utf-8")
+        (work / "hyperframes.json").write_text(json.dumps({"$schema": "https://hyperframes.heygen.com/schema/hyperframes.json"}) + "\n")
+        pngs = zrender.still(work, [i / fps for i in range(len(cases))], work / "stills",
+                             timeout_ms=int(settings.get("shaders.still_timeout_ms")),
+                             browser_gpu=settings.get("shaders.browser_gpu"))
+        out = [np.asarray(Image.open(p).convert("RGB")) for p in pngs]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)  # 12 October 2026: our own system temp folder, never the workshop.
+    for img in out:
+        if img.shape[:2] != (h, w):
+            raise RuntimeError(f"still has shape {img.shape}, expected {(h, w)}")
+    return out
+
+
+def render_glsl(ids_and_params, w: int, h: int, out_png: str | Path) -> Path:
+    # 12 October 2026: render ONE frame of one or more blocks (normal blend, bottom first) or of a full layer list,
+    # through HyperFrames, and write it as a lossless PNG.
+    from PIL import Image
+    img = render_glsl_batch([list(ids_and_params)], w, h)[0]
+    out_png = Path(out_png)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(img).save(out_png)
+    return out_png
+
+
+def rebuild_index() -> Path:
+    # 12 October 2026: index.json summarises every block folder; written only when its content changes.
+    blocks = []
+    for bid in list_blocks():
+        b = load(bid)
+        m = b["meta"]
+        digest = hashlib.sha256((b["glsl"] + (b["path"] / "twin.py").read_text(encoding="utf-8")).encode()).hexdigest()[:16]
+        blocks.append({"id": bid, "family": m["family"], "description": m["description"], "tags": m.get("tags", []),
+                       "looks": m.get("looks", []), "params": [p["name"] for p in m["params"]], "licence": m["licence"],
+                       "source_url": m.get("source_url", ""), "sha256_16": digest})
+    path = root() / "index.json"
+    old = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    doc = {"schema": "zrmd/shader-bank@1", "updated": old.get("updated", ""), "count": len(blocks), "blocks": blocks}
+    if {k: v for k, v in doc.items() if k != "updated"} != {k: v for k, v in old.items() if k != "updated"}:
+        doc["updated"] = date.today().strftime("%d %B %Y").lstrip("0")
+        path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path

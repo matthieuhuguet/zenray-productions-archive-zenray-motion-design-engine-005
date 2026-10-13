@@ -1,0 +1,133 @@
+# 12 October 2026: tiny layer composition over the shader bank, evaluated two ways from ONE description:
+# in numpy through the twins (for fitting) and emitted as ONE GLSL ES 3.0 fragment shader (for rendering).
+#
+# A composition is a list of layers, bottom first, over a black canvas:
+#   {"block": "<id>", "params": {...}, "blend": "normal|add|multiply|screen", "mask": {"block": "<id>", "params": {...}}}
+# "params" may be partial (missing names take the block defaults), "blend" defaults to normal, "mask" is optional.
+# A tuple (id, params) is accepted as a normal layer without mask.
+#
+# Layer arithmetic, identical in both evaluators (12 October 2026):
+#   s = block(uv) as straight RGBA in 0..1 (mask blocks give (1, 1, 1, m); colour blocks alpha 1)
+#   a = s.a * mask.a * luma(mask.rgb)      (so a mask block gives m, a colour block gives its luminance)
+#   dst = mix(dst, B(dst, s.rgb), a), with B: normal s, add dst + s, multiply dst * s, screen 1 - (1 - dst)(1 - s)
+#   final colour = clamp(dst, 0, 1), written as 8-bit by the canvas.
+# FR : une composition de calques, évaluée en numpy pour l'ajustement et émise en un seul shader GLSL pour le rendu.
+from __future__ import annotations
+
+import numpy as np
+
+from . import bank
+
+BLENDS = ("normal", "add", "multiply", "screen")
+LUMA = (0.2126, 0.7152, 0.0722)  # 12 October 2026: Rec. 709 luma weights, used to turn a colour block into a mask.
+
+
+def normalise(layers) -> list[dict]:
+    # 12 October 2026: canonical layer dicts with full parameter sets; unknown blocks, blends or params raise.
+    out = []
+    for i, layer in enumerate(layers):
+        if isinstance(layer, (tuple, list)):
+            layer = {"block": layer[0], "params": layer[1] if len(layer) > 1 else {}}
+        blend = layer.get("blend", "normal")
+        if blend not in BLENDS:
+            raise ValueError(f"layer {i}: unknown blend '{blend}' (expected one of {BLENDS})")
+        meta = bank.load(layer["block"])["meta"]
+        item = {"block": layer["block"], "params": bank.resolve_params(meta, layer.get("params", {})), "blend": blend}
+        if layer.get("mask"):
+            mmeta = bank.load(layer["mask"]["block"])["meta"]
+            item["mask"] = {"block": layer["mask"]["block"],
+                            "params": bank.resolve_params(mmeta, layer["mask"].get("params", {}))}
+        out.append(item)
+    if not out:
+        raise ValueError("a composition needs at least one layer")
+    return out
+
+
+def _blend_np(dst: np.ndarray, src: np.ndarray, mode: str) -> np.ndarray:
+    if mode == "normal":
+        return src
+    if mode == "add":
+        return dst + src
+    if mode == "multiply":
+        return dst * src
+    return 1.0 - (1.0 - dst) * (1.0 - src)
+
+
+def evaluate(layers, w: int, h: int) -> np.ndarray:
+    # 12 October 2026: numpy evaluation through the twins. Returns HxWx3 float in 0..255 (not rounded).
+    layers = normalise(layers)
+    u, v = bank.uv_grid(w, h)
+    dst = np.zeros((h, w, 3))
+    luma = np.asarray(LUMA)
+    for layer in layers:
+        s = bank.twin_rgba(layer["block"], layer["params"], u, v)
+        a = s[..., 3:4]
+        if "mask" in layer:
+            m = bank.twin_rgba(layer["mask"]["block"], layer["mask"]["params"], u, v)
+            a = a * m[..., 3:4] * (m[..., :3] @ luma)[..., None]
+        dst = dst + (_blend_np(dst, s[..., :3], layer["blend"]) - dst) * a
+    return np.clip(dst, 0.0, 1.0) * 255.0
+
+
+_GLSL_TYPE = {"float": "float", "vec2": "vec2", "vec3": "vec3", "color": "vec3"}
+_GLSL_BLEND = {
+    "normal": "s",
+    "add": "d + s",
+    "multiply": "d * s",
+    "screen": "1.0 - (1.0 - d) * (1.0 - s)",
+}
+
+
+def _call(block_id: str, params: dict, prefix: str, uniforms: list[dict]) -> str:
+    meta = bank.load(block_id)["meta"]
+    names = []
+    for p in meta["params"]:
+        name = f"{prefix}_{p['name']}"
+        uniforms.append({"name": name, "type": _GLSL_TYPE[p["type"]], "value": params[p["name"]]})
+        names.append(name)
+    return f"{block_id}(uv{''.join(', ' + n for n in names)})"
+
+
+def emit_glsl(layers) -> tuple[str, list[dict]]:
+    # 12 October 2026: one fragment shader for the whole composition. Block functions are inlined once each, every
+    # layer parameter becomes a uniform u_l<i>_<name> (mask: u_l<i>m_<name>), u_resolution is set by the page.
+    layers = normalise(layers)
+    used = []
+    for layer in layers:
+        for bid in [layer["block"]] + ([layer["mask"]["block"]] if "mask" in layer else []):
+            if bid not in used:
+                used.append(bid)
+    uniforms: list[dict] = []
+    body = []
+    for i, layer in enumerate(layers):
+        call = _call(layer["block"], layer["params"], f"u_l{i}", uniforms)
+        lines = [f"  {{ // layer {i}: {layer['block']} ({layer['blend']})", f"    vec4 s = {call};", "    float a = s.a;"]
+        if "mask" in layer:
+            mcall = _call(layer["mask"]["block"], layer["mask"]["params"], f"u_l{i}m", uniforms)
+            lines.append(f"    vec4 m = {mcall};")
+            lines.append("    a *= m.a * dot(m.rgb, ZR_LUMA);")
+        lines.append(f"    dst = mix(dst, zr_blend_{layer['blend']}(dst, s.rgb), a);")
+        lines.append("  }")
+        body.extend(lines)
+    decls = "\n".join(f"uniform {u['type']} {u['name']};" for u in uniforms)
+    blends = "\n".join(f"vec3 zr_blend_{k}(vec3 d, vec3 s) {{ return {v}; }}" for k, v in _GLSL_BLEND.items())
+    funcs = "\n\n".join(f"// ---- block {bid} (datasets/shaders/{bid}/block.glsl)\n{bank.load(bid)['glsl'].strip()}" for bid in used)
+    src = f"""#version 300 es
+// Cooked by zrmd.shaders.compose from a layer list (12 October 2026); never edit by hand.
+precision highp float;
+uniform vec2 u_resolution;
+out vec4 zr_frag;
+const vec3 ZR_LUMA = vec3({LUMA[0]}, {LUMA[1]}, {LUMA[2]});
+{decls}
+{blends}
+
+{funcs}
+
+void main() {{
+  vec2 uv = vec2(gl_FragCoord.x / u_resolution.x, 1.0 - gl_FragCoord.y / u_resolution.y);
+  vec3 dst = vec3(0.0);
+{chr(10).join(body)}
+  zr_frag = vec4(clamp(dst, 0.0, 1.0), 1.0);
+}}
+"""
+    return src, uniforms

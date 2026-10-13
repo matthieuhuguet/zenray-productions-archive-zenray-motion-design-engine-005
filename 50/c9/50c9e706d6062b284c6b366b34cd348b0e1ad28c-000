@@ -1,0 +1,353 @@
+# 12 October 2026, 16:40 CEST: mask metrics of the F0 vector harness.
+# Every function takes coverage masks (float 0..1, H x W) so the same measure applies to a reference crop, a
+# Pillow raster, a Skia raster of glyph outlines or an SVG rendered by resvg. Two masks are compared after a
+# declared alignment (none, or top-left of the ink box), never after a silent registration that could hide a
+# wrong size. Defaults come from settings.json, section "vector.metrics".
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from zrmd import settings
+
+
+def _cfg() -> dict:
+    return settings.get("vector.metrics")
+
+
+def _t(threshold):
+    return _cfg()["ink_threshold"] if threshold is None else threshold
+
+
+# ---------------------------------------------------------------- alignment (12 October 2026)
+
+def ink_box(mask: np.ndarray, threshold: float | None = None) -> tuple[int, int, int, int] | None:
+    """(top, left, bottom, right) inclusive box of pixels at or above threshold, None when empty."""
+    ink = mask >= _t(threshold)
+    if not ink.any():
+        return None
+    ys = np.nonzero(ink.any(axis=1))[0]
+    xs = np.nonzero(ink.any(axis=0))[0]
+    return int(ys[0]), int(xs[0]), int(ys[-1]), int(xs[-1])
+
+
+def align_pair(a: np.ndarray, b: np.ndarray, mode: str | None = None, threshold: float | None = None,
+               margin: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    """Put two masks on one canvas. mode 'none': both anchored at (0, 0); 'ink_box': each cropped to its ink box
+    (plus margin) and anchored at its top-left, so a size or weight change shows as a misfit, not as a shift."""
+    mode = mode or _cfg()["align"]
+    a = np.asarray(a, np.float32)
+    b = np.asarray(b, np.float32)
+    if mode == "ink_box":
+        out = []
+        for m in (a, b):
+            box = ink_box(m, threshold)
+            if box is None:
+                out.append(np.zeros((1, 1), np.float32))
+                continue
+            t, l, bt, r = box
+            out.append(m[max(0, t - margin):bt + 1 + margin, max(0, l - margin):r + 1 + margin])
+        a, b = out
+    elif mode != "none":
+        raise ValueError(f"unknown align mode '{mode}' (none, ink_box)")
+    h = max(a.shape[0], b.shape[0])
+    w = max(a.shape[1], b.shape[1])
+    A = np.zeros((h, w), np.float32)
+    B = np.zeros((h, w), np.float32)
+    A[:a.shape[0], :a.shape[1]] = a
+    B[:b.shape[0], :b.shape[1]] = b
+    return A, B
+
+
+# ---------------------------------------------------------------- overlap and edges (12 October 2026)
+
+def iou(a: np.ndarray, b: np.ndarray, threshold: float | None = None) -> dict:
+    """Soft IoU (sum of minimum over sum of maximum coverage, exact on anti-aliased edges) and hard IoU of the
+    thresholded masks. Inputs must share a canvas (see align_pair)."""
+    if a.shape != b.shape:
+        raise ValueError(f"masks differ in shape {a.shape} vs {b.shape}; call align_pair first")
+    hi = float(np.maximum(a, b).sum())
+    soft = float(np.minimum(a, b).sum()) / hi if hi > 0 else 1.0
+    t = _t(threshold)
+    A, B = a >= t, b >= t
+    union = int((A | B).sum())
+    hard = int((A & B).sum()) / union if union else 1.0
+    return {"soft": round(soft, 6), "hard": round(hard, 6)}
+
+
+def _edge(ink: np.ndarray) -> np.ndarray:
+    import cv2
+    er = cv2.erode(ink.astype(np.uint8), np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    return ink & (er == 0)
+
+
+def edge_distance(a: np.ndarray, b: np.ndarray, threshold: float | None = None) -> dict:
+    """Chamfer distance in pixels between the outlines of two masks, both directions: for each edge pixel of a,
+    the Euclidean distance to the nearest edge pixel of b (a_to_b), and the reverse. mean is the average of
+    the two means, p95 and max (Hausdorff) are over both directions."""
+    import cv2
+    t = _cfg()["edge_threshold"] if threshold is None else threshold
+    if a.shape != b.shape:
+        raise ValueError(f"masks differ in shape {a.shape} vs {b.shape}; call align_pair first")
+    ea, eb = _edge(a >= t), _edge(b >= t)
+    if not ea.any() and not eb.any():
+        return {"a_to_b": 0.0, "b_to_a": 0.0, "mean": 0.0, "p95": 0.0, "max": 0.0}
+    if not ea.any() or not eb.any():
+        inf = float(math.hypot(*a.shape))
+        return {"a_to_b": inf, "b_to_a": inf, "mean": inf, "p95": inf, "max": inf}
+    da = cv2.distanceTransform((~eb).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[ea]
+    db = cv2.distanceTransform((~ea).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[eb]
+    both = np.concatenate([da, db])
+    return {"a_to_b": round(float(da.mean()), 4), "b_to_a": round(float(db.mean()), 4),
+            "mean": round(float((da.mean() + db.mean()) / 2), 4),
+            "p95": round(float(np.percentile(both, 95)), 4), "max": round(float(both.max()), 4)}
+
+
+# ---------------------------------------------------------------- strokes (12 October 2026)
+
+def _skeleton(ink: np.ndarray) -> np.ndarray:
+    from skimage.morphology import skeletonize
+    return skeletonize(ink)
+
+
+def stroke_widths(mask: np.ndarray, threshold: float | None = None) -> dict:
+    """Stroke width distribution in pixels: twice the distance to the background sampled on the skeleton,
+    endpoints excluded (they sit inside the terminal and read too thin). contrast = p90 / p10, the thick to thin
+    ratio (about 1 for a monolinear grotesque, 2 to 4 for a didone)."""
+    import cv2
+    ink = mask >= _t(threshold)
+    if ink.sum() < 4:
+        return {}
+    dist = cv2.distanceTransform(np.pad(ink, 1).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
+    sk = _skeleton(ink)
+    nb = _neighbours(sk)
+    keep = sk & (nb >= 2)
+    w = 2.0 * dist[keep]
+    w = w[w >= _cfg()["stroke_min_px"]]
+    if w.size == 0:
+        return {}
+    p = np.percentile(w, [10, 25, 50, 75, 90])
+    hist, edges = np.histogram(w, bins=12, range=(0, float(p[4]) * 1.5))
+    return {"p10": round(float(p[0]), 3), "p25": round(float(p[1]), 3), "p50": round(float(p[2]), 3),
+            "p75": round(float(p[3]), 3), "p90": round(float(p[4]), 3), "mean": round(float(w.mean()), 3),
+            "contrast": round(float(p[4] / max(p[0], 1e-6)), 3), "samples": int(w.size),
+            "hist": hist.tolist(), "hist_edges": [round(float(e), 3) for e in edges]}
+
+
+def _neighbours(sk: np.ndarray) -> np.ndarray:
+    import cv2
+    k = np.ones((3, 3), np.float32)
+    k[1, 1] = 0
+    return cv2.filter2D(sk.astype(np.float32), -1, k, borderType=cv2.BORDER_CONSTANT).astype(np.int32) * sk
+
+
+def terminal_angles(mask: np.ndarray, threshold: float | None = None, walk_px: int | None = None) -> dict:
+    """Direction of each stroke terminal, in degrees (0 = pointing right, 90 = up, counter-clockwise): from the
+    skeleton point walk_px pixels inside the stroke to the skeleton endpoint. Returns the list (sorted by x) and
+    an 8-bin histogram, which separates horizontal cuts (grotesques: 0 and 180) from angled ones."""
+    walk_px = walk_px or _cfg()["terminal_walk_px"]
+    ink = mask >= _t(threshold)
+    sk = _skeleton(ink)
+    nb = _neighbours(sk)
+    ends = np.argwhere(sk & (nb == 1))
+    angles = []
+    offsets = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    h, w = sk.shape
+    for y0, x0 in ends:
+        prev, cur = None, (int(y0), int(x0))
+        for _ in range(walk_px):
+            nxt = None
+            for dy, dx in offsets:
+                y, x = cur[0] + dy, cur[1] + dx
+                if 0 <= y < h and 0 <= x < w and sk[y, x] and (y, x) != prev and (y, x) != (int(y0), int(x0)):
+                    nxt = (y, x)
+                    break
+            if nxt is None or nb[nxt] > 2:
+                break
+            prev, cur = cur, nxt
+        if cur == (int(y0), int(x0)):
+            continue
+        ang = math.degrees(math.atan2(-(y0 - cur[0]), x0 - cur[1])) % 360.0
+        angles.append({"x": int(x0), "y": int(y0), "angle": round(ang, 2)})
+    angles.sort(key=lambda r: (r["x"], r["y"]))
+    hist = np.histogram([a["angle"] for a in angles], bins=8, range=(-22.5, 337.5))[0] if angles else np.zeros(8, int)
+    # Fold 337.5..360 into the first bin.
+    wrap = sum(1 for a in angles if a["angle"] >= 337.5)
+    hist = hist.tolist()
+    hist[0] += wrap
+    return {"count": len(angles), "angles": angles, "hist8": hist}
+
+
+# ---------------------------------------------------------------- vertical metrics (12 October 2026)
+
+def _components(ink: np.ndarray):
+    import cv2
+    n, lab, st, cen = cv2.connectedComponentsWithStats(ink.astype(np.uint8), connectivity=8)
+    return [{"x": int(x), "y": int(y), "w": int(w), "h": int(h), "area": int(a), "cx": float(c[0])}
+            for (x, y, w, h, a), c in zip(st[1:], cen[1:]) if a > 4]
+
+
+def vertical_metrics(mask: np.ndarray, threshold: float | None = None) -> dict:
+    """Baseline, x-height, cap height and ascender, descender in pixels from the ink alone.
+    baseline: median bottom of components resting on the dominant bottom line; x-height: the shared reading of
+    zrmd.analyze.typography.x_height_components; cap height: the lower cluster of the tall components that rest
+    on the baseline (capitals sit a little lower than ascenders in most families); ascender: the upper cluster."""
+    from zrmd.analyze.typography import x_height_components
+    ink = mask >= _t(threshold)
+    comps = _components(ink)
+    if len(comps) < 2:
+        return {}
+    bottoms = np.array([c["y"] + c["h"] for c in comps], float)
+    vals, counts = np.unique(np.round(bottoms), return_counts=True)
+    base_mode = vals[np.argmax(counts)]
+    on_base = [c for c in comps if abs(c["y"] + c["h"] - base_mode) <= max(2.0, 0.03 * mask.shape[0])]
+    baseline = float(np.median([c["y"] + c["h"] for c in on_base]))
+    xh = x_height_components(ink)
+    out = {"baseline": round(baseline, 2), "x_height": round(float(xh), 2) if xh else None}
+    top = float(min(c["y"] for c in comps))
+    bottom = float(max(c["y"] + c["h"] for c in comps))
+    out["ascender"] = round(baseline - top, 2)
+    out["descender"] = round(bottom - baseline, 2)
+    if xh:
+        tall = sorted(c["h"] for c in on_base if c["h"] >= 1.25 * xh)
+        if tall:
+            groups, cur = [], [tall[0]]
+            for h in tall[1:]:
+                if h - cur[-1] > max(1.0, 0.025 * h):
+                    groups.append(cur)
+                    cur = [h]
+                else:
+                    cur.append(h)
+            groups.append(cur)
+            out["cap_height"] = round(float(np.median(groups[0])), 2)
+            out["ascender_height"] = round(float(np.median(groups[-1])), 2)
+    return out
+
+
+# ---------------------------------------------------------------- horizontal profile (12 October 2026)
+
+def ink_spans(mask: np.ndarray, threshold: float | None = None) -> list[dict]:
+    """Glyph-like spans from the ink: connected components merged when their x ranges overlap (an i and its dot,
+    accents), sorted left to right. Each span: left, right (inclusive), centroid x (coverage weighted), width."""
+    ink = mask >= _t(threshold)
+    comps = sorted(_components(ink), key=lambda c: c["x"])
+    spans = []
+    for c in comps:
+        l, r = c["x"], c["x"] + c["w"] - 1
+        if spans:
+            s = spans[-1]
+            ov = min(r, s["right"]) - max(l, s["left"]) + 1
+            if ov >= 0.5 * min(r - l + 1, s["right"] - s["left"] + 1):
+                s["left"], s["right"] = min(s["left"], l), max(s["right"], r)
+                continue
+        spans.append({"left": l, "right": r})
+    cols = np.asarray(mask, np.float64)
+    xs = np.arange(cols.shape[1])
+    for s in spans:
+        band = cols[:, s["left"]:s["right"] + 1].sum(axis=0)
+        s["cx"] = round(float((band * xs[s["left"]:s["right"] + 1]).sum() / max(band.sum(), 1e-9)), 3)
+        s["width"] = s["right"] - s["left"] + 1
+    return spans
+
+
+def advances(mask: np.ndarray, threshold: float | None = None) -> dict:
+    """Ink-profile advances: centroid-to-centroid pitch and the white gap between consecutive spans, in pixels.
+    The gap is what kerning changes; the pitch is the advance seen through the glyph shapes."""
+    spans = ink_spans(mask, threshold)
+    pitch = [round(b["cx"] - a["cx"], 3) for a, b in zip(spans, spans[1:])]
+    gaps = [b["left"] - a["right"] - 1 for a, b in zip(spans, spans[1:])]
+    return {"spans": len(spans), "pitch": pitch, "gaps": gaps,
+            "ink_width": (spans[-1]["right"] - spans[0]["left"] + 1) if spans else 0}
+
+
+def kerning_from_profiles(kerned: np.ndarray, plain: np.ndarray, threshold: float | None = None) -> list[float] | None:
+    """Kerning per adjacent pair measured from the ink: gap of the kerned line minus gap of the same line set
+    without kerning (negative = pulled together). None when the two lines do not split into the same spans."""
+    a, b = advances(kerned, threshold), advances(plain, threshold)
+    if a["spans"] != b["spans"]:
+        return None
+    return [float(x - y) for x, y in zip(a["gaps"], b["gaps"])]
+
+
+# ---------------------------------------------------------------- bundles (12 October 2026)
+
+def measure(mask: np.ndarray, threshold: float | None = None) -> dict:
+    """All single-mask measures of a line or shape."""
+    return {"ink_box": ink_box(mask, threshold), "coverage": round(float(np.asarray(mask).sum()), 3),
+            "vertical": vertical_metrics(mask, threshold), "strokes": stroke_widths(mask, threshold),
+            "advances": advances(mask, threshold), "terminals": terminal_angles(mask, threshold)}
+
+
+def compare(a: np.ndarray, b: np.ndarray, align: str | None = None, threshold: float | None = None) -> dict:
+    """Pair measures after alignment: IoU, chamfer edge distance, and the differences of the content-independent
+    measures (stroke p50 and contrast, x-height, cap height, ink width)."""
+    A, B = align_pair(a, b, align, threshold)
+    ma, mb = measure(a, threshold), measure(b, threshold)
+
+    def delta(path):
+        x, y = ma, mb
+        for p in path:
+            x = (x or {}).get(p) if isinstance(x, dict) else None
+            y = (y or {}).get(p) if isinstance(y, dict) else None
+        return None if x is None or y is None else round(float(y) - float(x), 4)
+
+    return {"iou": iou(A, B, threshold), "edge": edge_distance(A, B), "shape": list(A.shape),
+            "delta": {"stroke_p50": delta(["strokes", "p50"]), "stroke_contrast": delta(["strokes", "contrast"]),
+                      "x_height": delta(["vertical", "x_height"]), "cap_height": delta(["vertical", "cap_height"]),
+                      "ink_width": delta(["advances", "ink_width"])},
+            "a": ma, "b": mb}
+
+
+# ---------------------------------------------------------------- F2 additions: weighted and sub-pixel measures (12 October 2026)
+
+def weighted_iou(a: np.ndarray, b: np.ndarray, weight: np.ndarray | None = None) -> float:
+    """Soft IoU over pixels of non-zero weight (weight 0 marks pixels hidden by an upper layer). 12 October 2026."""
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    w = np.ones_like(a) if weight is None else np.asarray(weight, np.float64)
+    hi = float((np.maximum(a, b) * w).sum())
+    return round(float((np.minimum(a, b) * w).sum()) / hi, 6) if hi > 0 else 1.0
+
+
+def subpixel_edge_distance(a: np.ndarray, b: np.ndarray, weight: np.ndarray | None = None, level: float = 0.5,
+                           step: float = 0.1) -> dict:
+    """Distance in pixels between the sub-pixel iso-contours (marching squares at level) of two coverage maps,
+    both directions, point to polyline through a densified contour (step px), ignoring contour points that fall
+    on zero-weight pixels. Unlike edge_distance it is not quantised to the pixel grid. 12 October 2026."""
+    from scipy.spatial import cKDTree
+    from skimage import measure
+
+    def pts(m):
+        p = np.pad(np.asarray(m, np.float64), 1)
+        out = []
+        for c in measure.find_contours(p, level):
+            c = c - 1
+            seg = np.hypot(*np.diff(c, axis=0).T)
+            s = np.concatenate([[0], np.cumsum(seg)])
+            if s[-1] <= 0:
+                continue
+            q = np.linspace(0, s[-1], max(2, int(s[-1] / step)))
+            out.append(np.stack([np.interp(q, s, c[:, 0]), np.interp(q, s, c[:, 1])], 1))
+        return np.vstack(out) if out else np.zeros((0, 2))
+
+    pa, pb = pts(a), pts(b)
+    if weight is not None:
+        wmap = np.asarray(weight)
+
+        def keep(p):
+            iy = np.clip(np.round(p[:, 0]).astype(int), 0, wmap.shape[0] - 1)
+            ix = np.clip(np.round(p[:, 1]).astype(int), 0, wmap.shape[1] - 1)
+            return p[wmap[iy, ix] > 0]
+        pa, pb = keep(pa), keep(pb)
+    if len(pa) == 0 and len(pb) == 0:
+        return {"a_to_b": 0.0, "b_to_a": 0.0, "mean": 0.0, "p95": 0.0, "max": 0.0}
+    if len(pa) == 0 or len(pb) == 0:
+        inf = float(math.hypot(*np.asarray(a).shape))
+        return {"a_to_b": inf, "b_to_a": inf, "mean": inf, "p95": inf, "max": inf}
+    da, _ = cKDTree(pb).query(pa)
+    db, _ = cKDTree(pa).query(pb)
+    both = np.concatenate([da, db])
+    return {"a_to_b": round(float(da.mean()), 4), "b_to_a": round(float(db.mean()), 4),
+            "mean": round(float((da.mean() + db.mean()) / 2), 4), "p95": round(float(np.percentile(both, 95)), 4),
+            "max": round(float(both.max()), 4)}

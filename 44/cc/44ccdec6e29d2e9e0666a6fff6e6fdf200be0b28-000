@@ -1,0 +1,46 @@
+# 12 October 2026, 03:22 CEST: reads settings.json once; get("a.b") returns a deep copy so callers never mutate defaults.
+from __future__ import annotations
+
+import copy
+import json
+import os
+from functools import lru_cache
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SETTINGS = REPO / "settings.json"
+
+
+def _expand(node):
+    # 13 October 2026: "{engine}" in a string value is the folder of this repository, so the repository can live anywhere
+    # (it left the tmp workshop on 13 October 2026). FR : "{engine}" = dossier du depot, il peut donc se deplacer.
+    if isinstance(node, str):
+        return node.replace("{engine}", str(REPO))
+    if isinstance(node, dict):
+        return {k: _expand(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_expand(v) for v in node]
+    return node
+
+
+@lru_cache(maxsize=1)
+def _load() -> dict:
+    return _expand(json.loads(SETTINGS.read_text(encoding="utf-8")))
+
+
+def get(dotted: str, default=None):
+    node = _load()
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            if default is not None:
+                return copy.deepcopy(default)
+            raise KeyError(f"settings.json has no '{dotted}'")
+        node = node[part]
+    return copy.deepcopy(node)
+
+
+def path(name: str) -> Path:
+    # 12 October 2026: ZRMD_PATH_<NAME> overrides a path for an isolated test workshop (service end-to-end tests);
+    # without it, settings.json is the only truth.
+    override = os.environ.get(f"ZRMD_PATH_{name.upper()}")
+    return Path(override) if override else Path(get(f"paths.{name}"))

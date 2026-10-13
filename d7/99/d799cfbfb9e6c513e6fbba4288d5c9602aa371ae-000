@@ -1,0 +1,370 @@
+# 12 October 2026, 20:10 CEST: F2 2D asset and SVG creator.
+# vectorise() turns a crop (H, W, 3 uint8) into an editable asset: segmentation, colour models, stacking, coverage
+# targets and blur (zrmd.vector.trace), primitive recognition first (zrmd.vector.primitives) and a refined free
+# path otherwise. params.json is the single truth (schema zrmd/asset2d@1): palette, layers with kind, geometry,
+# paint (flat colour from the palette, linear or radial gradient with stops), stroke, effects (blur, opacity) and
+# the fit measures. cook_svg() bakes params.json into asset.svg with one named <g> per layer, so changing a value
+# in params.json and running rebuild() gives a new version V_NNN without retracing. evaluate() writes
+# fidelity.json: per layer soft IoU and sub-pixel edge distance against the layer target, and the composite colour
+# error against the source. Defaults: settings.json, section "vector.trace".
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import os
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+from zrmd import settings
+from zrmd import versions as V
+from zrmd.vector import metrics as M
+from zrmd.vector import primitives as P
+from zrmd.vector import render as R
+from zrmd.vector import trace as T
+
+SCHEMA = "zrmd/asset2d@1"
+SHADER_HINTS = {"linear": ["linear_ramp4", "gradient_stops6"], "radial": ["radial_gradient3", "glow_gaussian"],
+                "blur:circle": ["blur_disc_gaussian", "bloom_disc"], "blur:rect": ["blur_rect_gaussian", "bloom_rect"],
+                "blur:rounded_rect": ["blur_rect_gaussian", "glow_rounded_rect"], "blur:ellipse": ["blur_disc_gaussian"]}
+
+
+def _cfg() -> dict:
+    return settings.get("vector.trace")
+
+
+def _f(v, digits=4) -> str:
+    return f"{round(float(v), digits):g}"
+
+
+# ---------------------------------------------------------------- cooking params.json into SVG (12 October 2026)
+
+def _resolve(colour: str, palette: dict) -> str:
+    if colour.startswith("@"):
+        key = colour[1:]
+        if key not in palette:
+            raise KeyError(f"palette has no colour '{key}' (palette: {sorted(palette)})")
+        return palette[key]
+    return colour
+
+
+def _paint_defs(layer: dict, palette: dict) -> tuple[str, str]:
+    """(paint reference, defs markup) of a layer paint."""
+    p = layer["paint"]
+    gid = f"grad-{layer['id']}"
+    if p["type"] == "flat":
+        return _resolve(p["colour"], palette), ""
+    stops = "".join(f'<stop offset="{_f(s["offset"], 5)}" stop-color="{_resolve(s["colour"], palette)}"/>' for s in p["stops"])
+    if p["type"] == "linear":
+        d = (f'<linearGradient id="{gid}" gradientUnits="userSpaceOnUse" x1="{_f(p["x1"])}" y1="{_f(p["y1"])}" '
+             f'x2="{_f(p["x2"])}" y2="{_f(p["y2"])}">{stops}</linearGradient>')
+    elif p["type"] == "radial":
+        d = (f'<radialGradient id="{gid}" gradientUnits="userSpaceOnUse" cx="{_f(p["cx"])}" cy="{_f(p["cy"])}" '
+             f'r="{_f(p["r"])}">{stops}</radialGradient>')
+    else:
+        raise ValueError(f"unknown paint type '{p['type']}'")
+    return f"url(#{gid})", d
+
+
+def _arc_d(g: dict) -> str:
+    a0 = math.radians(g["start"])
+    a1 = math.radians(g["start"] + g["sweep"])
+    x0, y0 = g["cx"] + g["r"] * math.cos(a0), g["cy"] + g["r"] * math.sin(a0)
+    x1, y1 = g["cx"] + g["r"] * math.cos(a1), g["cy"] + g["r"] * math.sin(a1)
+    large = 1 if abs(g["sweep"]) > 180 else 0
+    sweep = 1 if g["sweep"] >= 0 else 0
+    return f"M{_f(x0)} {_f(y0)}A{_f(g['r'])} {_f(g['r'])} 0 {large} {sweep} {_f(x1)} {_f(y1)}"
+
+
+def _stroke_d(nodes) -> str:
+    parts = []
+    for c in nodes:
+        c = np.asarray(c, float)
+        parts.append(f"M{_f(c[0, 0, 0])} {_f(c[0, 0, 1])}")
+        for k in range(len(c) - 1):
+            parts.append("C" + " ".join(f"{_f(x)} {_f(y)}" for x, y in (c[k, 1], c[k, 2], c[k + 1, 0])))
+    return "".join(parts)
+
+
+def cook_element(layer: dict, paint: str) -> str:
+    """The SVG element of one layer, with the same geometry semantics as primitives.skia_path."""
+    k, g = layer["kind"], layer["geometry"]
+    if k in P.STROKE_KINDS:
+        attrs = (f'fill="none" stroke="{paint}" stroke-width="{_f(g["width"])}" stroke-linecap="{g.get("cap", "round")}" '
+                 f'stroke-linejoin="{g.get("join", "round")}"')
+    else:
+        attrs = f'fill="{paint}"'
+    rot = (f' transform="rotate({_f(g["angle"])} {_f(g["cx"])} {_f(g["cy"])})"'
+           if k in ("ellipse", "rect", "rounded_rect") and g.get("angle") else "")
+    if k == "circle":
+        return f'<circle cx="{_f(g["cx"])}" cy="{_f(g["cy"])}" r="{_f(g["r"])}" {attrs}/>'
+    if k == "ellipse":
+        return f'<ellipse cx="{_f(g["cx"])}" cy="{_f(g["cy"])}" rx="{_f(g["rx"])}" ry="{_f(g["ry"])}"{rot} {attrs}/>'
+    if k in ("rect", "rounded_rect"):
+        rr = ""
+        if k == "rounded_rect":
+            rad = min(max(g["radius"], 0.0), g["w"] / 2, g["h"] / 2)
+            rr = f' rx="{_f(rad)}" ry="{_f(rad)}"'
+        return (f'<rect x="{_f(g["cx"] - g["w"] / 2)}" y="{_f(g["cy"] - g["h"] / 2)}" width="{_f(g["w"])}" '
+                f'height="{_f(g["h"])}"{rr}{rot} {attrs}/>')
+    if k == "line":
+        return f'<line x1="{_f(g["x1"])}" y1="{_f(g["y1"])}" x2="{_f(g["x2"])}" y2="{_f(g["y2"])}" {attrs}/>'
+    if k == "arc":
+        if abs(g["sweep"]) >= 359.99:
+            return f'<circle cx="{_f(g["cx"])}" cy="{_f(g["cy"])}" r="{_f(g["r"])}" {attrs}/>'
+        return f'<path d="{_arc_d(g)}" {attrs}/>'
+    if k == "polyline":
+        # 12 October 2026: one <polyline> per run, so each run stays an editable list of points.
+        return "".join(f'<polyline points="{" ".join(f"{_f(x)},{_f(y)}" for x, y in run)}" {attrs}/>'
+                       for run in g["polylines"])
+    if k == "stroke_path":
+        return f'<path d="{_stroke_d(g["nodes"])}" {attrs}/>'
+    if k == "path":
+        return f'<path d="{g["d"]}" fill-rule="evenodd" {attrs}/>'
+    raise ValueError(f"unknown layer kind '{k}'")
+
+
+def cook_svg(params: dict, only: str | None = None, white: bool = False) -> str:
+    """asset.svg from params.json. only=layer id renders that layer alone; white=True paints it opaque white
+    (used to measure a layer's coverage)."""
+    w, h = params["canvas"]["width"], params["canvas"]["height"]
+    pal = params.get("palette", {})
+    defs, body = [], []
+    for layer in sorted(params["layers"], key=lambda l: l["z"]):
+        if only and layer["id"] != only:
+            continue
+        if layer.get("visible", True) is False:
+            continue
+        paint, d = ("#ffffff", "") if white else _paint_defs(layer, pal)
+        if d:
+            defs.append(d)
+        fx = layer.get("effects", {})
+        extra = ""
+        if fx.get("blur", 0) > 0:
+            fid = f"blur-{layer['id']}"
+            defs.append(f'<filter id="{fid}" filterUnits="userSpaceOnUse" x="0" y="0" width="{w}" height="{h}">'
+                        f'<feGaussianBlur stdDeviation="{_f(fx["blur"])}"/></filter>')
+            extra += f' filter="url(#{fid})"'
+        if not white and fx.get("opacity", 1.0) < 1.0:
+            extra += f' opacity="{_f(fx["opacity"])}"'
+        body.append(f'<g id="{layer["name"]}" data-kind="{layer["kind"]}"{extra}>{cook_element(layer, paint)}</g>')
+    meta = {"schema": SCHEMA, "asset": params.get("asset"), "version": params.get("version"), "date": params.get("date")}
+    return "\n".join([f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
+                      f"<metadata>{json.dumps(meta, ensure_ascii=False)}</metadata>",
+                      "<defs>" + "".join(defs) + "</defs>", *body, "</svg>"])
+
+
+# ---------------------------------------------------------------- vectorisation (12 October 2026)
+
+def _layer_job(job: dict) -> dict:
+    """Worker: primitive recognition, then a refined free path if no primitive passes."""
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    cfg = job["cfg"]
+    tgt, wt, cm, origin, blur = job["target"], job["weight"], job["contour_mask"], job["origin"], job["blur"]
+    rec = {"accepted": False, "tried": [], "stats": None}
+    if cfg["primitives"]["enabled"] or job.get("force"):
+        rec = P.recognise(tgt, wt, cm, origin, blur, cfg, force=job.get("force"), refine=job["refine"],
+                          sabotage=job["sabotage"])
+    out = {"index": job["index"], "tried": rec["tried"], "stats": rec["stats"]}
+    if rec["accepted"]:
+        b = rec["best"]
+        out.update(kind=b["kind"], geometry=P.geometry_json(b["kind"], b["geometry"]), blur=b["blur"],
+                   fit={"iou": b["iou"], "edge_mean": b["edge"]["mean"], "nfev": b["nfev"]})
+        return out
+    if job.get("force"):
+        out.update(kind=None, rejected=job["force"])
+        return out
+    tr = T.trace_layer(tgt, wt, cm, origin, blur, cfg, refine=job["refine"])
+    out.update(kind="path", geometry={"d": tr["d"], "segments": tr["segments"]}, blur=tr["blur"],
+               fit={"refine": tr["refine"]})
+    return out
+
+
+def analyse(rgb: np.ndarray, cfg: dict | None = None) -> dict:
+    """Segmentation, colour models, stacking and per-layer coverage targets (full canvas)."""
+    cfg = cfg or _cfg()
+    rgb = np.asarray(rgb)[..., :3]
+    seg = T.segment(rgb, cfg)
+    labels, n = seg["labels"], seg["n"]
+    models = {i: T.fit_colour_model(rgb, labels == i, cfg) for i in range(n)}
+    st = T.stack_order(labels, n, cfg)
+    labels, models, merged = T.merge_revealed(rgb, labels, models, st, cfg)
+    if merged:
+        n = len(models)
+        st = T.stack_order(labels, n, cfg)
+    layers = []
+    for idx, lab in enumerate(st["order"]):
+        if lab == st["background"]:
+            layers.append({"label": lab, "background": True})
+            continue
+        tg = T.layer_target(rgb, labels, models, st["order"], idx, st["filled"], cfg)
+        blur = T.estimate_blur(tg["alpha"], tg["weight"], tg["signed_dist"], cfg)
+        if blur > 0:
+            tg = T.layer_target(rgb, labels, models, st["order"], idx, st["filled"], cfg,
+                                band=max(cfg["band_px"], int(math.ceil(3 * blur)) + 2))
+        layers.append({"label": lab, "background": False, "blur": blur, **tg})
+    return {"labels": labels, "n": n, "models": models, "stack": st, "layers": layers,
+            "merged": {int(k): int(v) for k, v in merged.items()}}
+
+
+def _crop_box(mask: np.ndarray, margin: int):
+    ys, xs = np.nonzero(mask)
+    h, w = mask.shape
+    return max(0, ys.min() - margin), min(h, ys.max() + 1 + margin), max(0, xs.min() - margin), min(w, xs.max() + 1 + margin)
+
+
+def vectorise(rgb: np.ndarray, asset_id: str, source: dict | None = None, force: dict | None = None,
+              refine: bool = True, sabotage: bool = False, workers: int | None = None, cfg: dict | None = None) -> dict:
+    """Vectorise a crop into params (not yet written). force maps a layer z index to a primitive kind."""
+    cfg = cfg or _cfg()
+    rgb = np.asarray(rgb)[..., :3]
+    h, w = rgb.shape[:2]
+    an = analyse(rgb, cfg)
+    jobs = []
+    for z, L in enumerate(an["layers"]):
+        if L["background"]:
+            continue
+        m = int(cfg["crop_margin_px"] + math.ceil(3 * L["blur"]))
+        y0, y1, x0, x1 = _crop_box(L["contour_mask"] | (L["alpha"] > 0.01), m)
+        jobs.append({"index": z, "target": L["alpha"][y0:y1, x0:x1], "weight": L["weight"][y0:y1, x0:x1],
+                     "contour_mask": L["contour_mask"][y0:y1, x0:x1], "origin": (x0, y0), "blur": L["blur"],
+                     "force": (force or {}).get(z), "refine": refine, "sabotage": sabotage, "cfg": cfg})
+    workers = workers or cfg["workers"]
+    if workers > 1 and len(jobs) > 1:
+        with ProcessPoolExecutor(max_workers=min(workers, len(jobs))) as ex:
+            results = list(ex.map(_layer_job, jobs))
+    else:
+        results = [_layer_job(j) for j in jobs]
+    by_index = {r["index"]: r for r in results}
+    palette, pal_keys = {}, {}
+
+    def paint_of(model):
+        m = {k: v for k, v in model.items() if k not in ("rms",)}
+        if m["type"] == "flat":
+            c = m["colour"]
+            if c not in pal_keys:
+                pal_keys[c] = f"c{len(pal_keys)}"
+                palette[pal_keys[c]] = c
+            m["colour"] = "@" + pal_keys[c]
+        m["fit_rms"] = model.get("rms")
+        return m
+
+    layers, rejected = [], []
+    for z, L in enumerate(an["layers"]):
+        model = an["models"][L["label"]]
+        lid = f"L{z:02d}"
+        if L["background"]:
+            layers.append({"id": lid, "name": f"{lid}-background", "z": z, "kind": "rect",
+                           "geometry": {"cx": w / 2, "cy": h / 2, "w": float(w), "h": float(h), "angle": 0.0},
+                           "paint": paint_of(model), "effects": {"blur": 0.0, "opacity": 1.0}, "fit": {"background": True},
+                           "shader_hint": SHADER_HINTS.get(model["type"], ["solid_color"])})
+            continue
+        r = by_index[z]
+        if r.get("kind") is None:
+            rejected.append({"z": z, "kind": r.get("rejected"), "tried": r["tried"]})
+            continue
+        hints = list(SHADER_HINTS.get(model["type"], []))
+        if r["blur"] > 0:
+            hints += SHADER_HINTS.get(f"blur:{r['kind']}", ["blur_disc_gaussian"])
+        layers.append({"id": lid, "name": f"{lid}-{r['kind']}", "z": z, "kind": r["kind"], "geometry": r["geometry"],
+                       "paint": paint_of(model), "effects": {"blur": r["blur"], "opacity": 1.0},
+                       "fit": {**r["fit"], "tried": r["tried"], "stats": r["stats"]}, "shader_hint": hints})
+    params = {"schema": SCHEMA, "asset": asset_id, "date": V.today(), "canvas": {"width": int(w), "height": int(h)},
+              "source": source or {}, "palette": palette, "layers": layers,
+              "editing": "change palette colours, layer geometry, paint stops or effects here, then run "
+                         "Scripts/Vectorise.py rebuild to cook a new version (12 October 2026)",
+              "trace": {"refine": refine, "sabotage": sabotage, "rejected": rejected,
+                        "settings": {k: cfg[k] for k in ("smooth_step", "fit_error_px", "band_px")}}}
+    if source and source.get("kind") == "reference-crop":
+        params["rights"] = "private-1to1: benchmark of a reference, never published; publish variations only after rights validation"
+    return {"params": params, "analysis": an}
+
+
+# ---------------------------------------------------------------- fidelity (12 October 2026)
+
+def evaluate(params: dict, rgb: np.ndarray, analysis: dict | None = None, cfg: dict | None = None) -> dict:
+    """Fidelity of a cooked asset against its source: every layer rendered alone (white, through skia.SVGDOM)
+    against its coverage target, and the composite colour error. pass follows vector.trace.fidelity."""
+    cfg = cfg or _cfg()
+    fc = cfg["fidelity"]
+    rgb = np.asarray(rgb)[..., :3].astype(np.float64)
+    w, h = params["canvas"]["width"], params["canvas"]["height"]
+    ss = int(cfg.get("raster_ss", 1))                   # 12 October 2026: reference rasteriser (settings vector.trace)
+    comp = R.render_svg(cook_svg(params), w, h, engine="skia", ss=ss)[..., :3].astype(np.float64)
+    err = np.abs(comp - rgb).max(-1)
+    colour = {"mae": round(float(np.abs(comp - rgb).mean()), 4), "p99": round(float(np.percentile(err, 99)), 3),
+              "max": round(float(err.max()), 3), "share_over_16": round(float((err > 16).mean()), 6)}
+    per = []
+    if analysis is not None:
+        for z, L in enumerate(analysis["layers"]):
+            if L["background"]:
+                continue
+            lid = f"L{z:02d}"
+            if not any(l["id"] == lid for l in params["layers"]):
+                per.append({"id": lid, "missing": True, "ok": False})
+                continue
+            cov = R.svg_mask(cook_svg(params, only=lid, white=True), w, h, engine="skia", ss=ss).astype(np.float64)
+            iou = M.weighted_iou(cov, L["alpha"], L["weight"])
+            edge = M.subpixel_edge_distance(cov, L["alpha"], L["weight"])
+            ok = iou >= fc["iou_min"] and edge["mean"] <= fc["edge_mean_max_px"]
+            kind = next(l["kind"] for l in params["layers"] if l["id"] == lid)
+            per.append({"id": lid, "kind": kind, "iou": iou, "edge_mean": edge["mean"], "edge_p95": edge["p95"], "ok": ok})
+    layers_ok = all(p["ok"] for p in per)
+    colour_ok = colour["mae"] <= fc["colour_mae_max"] and colour["p99"] <= fc["colour_p99_max"]
+    worst = min((p for p in per if "iou" in p), key=lambda p: p["iou"], default=None)
+    return {"date": V.today(), "rule": fc, "layers": per, "colour": colour, "layers_ok": layers_ok,
+            "colour_ok": colour_ok, "pass": bool(layers_ok and colour_ok),
+            "worst_layer": worst, "min_iou": worst["iou"] if worst else None,
+            "max_edge_mean": max((p["edge_mean"] for p in per if "edge_mean" in p), default=None)}
+
+
+# ---------------------------------------------------------------- versions on disk (12 October 2026)
+
+def assets_root() -> Path:
+    return Path(_cfg()["assets_dir"])
+
+
+def write_version(asset_dir: Path, params: dict, rgb: np.ndarray | None, fidelity: dict | None,
+                  parent: str | None = None, note: str = "") -> Path:
+    """Write V_NNN (never overwriting): params.json, asset.svg, render.png, fidelity.json, version.json."""
+    from PIL import Image
+    asset_dir = Path(asset_dir)
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    name = V.next_version(asset_dir)
+    vdir = asset_dir / name
+    vdir.mkdir()
+    params = copy.deepcopy(params)
+    params["version"] = name
+    params["parent"] = parent
+    svg = cook_svg(params)
+    (vdir / "params.json").write_text(json.dumps(params, indent=1, ensure_ascii=False), encoding="utf-8")
+    (vdir / "asset.svg").write_text(svg, encoding="utf-8")
+    w, h = params["canvas"]["width"], params["canvas"]["height"]
+    Image.fromarray(R.render_svg(svg, w, h, engine="skia", ss=int(_cfg().get("raster_ss", 1)))).save(vdir / "render.png")
+    if fidelity is not None:
+        (vdir / "fidelity.json").write_text(json.dumps(fidelity, indent=1), encoding="utf-8")
+    (vdir / "version.json").write_text(json.dumps({"version": name, "parent": parent, "date": V.stamp(), "note": note},
+                                                  indent=1), encoding="utf-8")
+    return vdir
+
+
+def apply_overrides(params: dict, overrides: dict) -> dict:
+    """Overrides: {"palette": {...}, "layers": {"L02": {"geometry": {...}, "paint": {...}, "effects": {...}}}, ...}.
+    Layers are addressed by id; an unknown id is an error that names it."""
+    out = copy.deepcopy(params)
+    ov = copy.deepcopy(overrides or {})
+    by_id = {l["id"]: l for l in out["layers"]}
+    for lid, change in (ov.pop("layers", None) or {}).items():
+        if lid not in by_id:
+            raise KeyError(f"no layer '{lid}' (layers: {sorted(by_id)})")
+        merged = V.deep_merge(by_id[lid], change)
+        by_id[lid].clear()
+        by_id[lid].update(merged)
+    return V.deep_merge(out, ov)
+
+
+def sha256_file(path: str | Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()

@@ -1,0 +1,695 @@
+# 12 October 2026, 20:30 CEST: parametric font creator of F1 (when no free family reaches the 99 match rule).
+# Start from the closest free font found by zrmd.vector.fontfit, instance it at the fitted axes (fontTools
+# varLib.instancer, a static glyf font), then fit parameters so that the rendered string lands on the reference
+# mask 1:1, and build a real .ttf with fontTools. The font is a pure function of (base file, params.json): a
+# variation is a parameter change and a rebuild, never a manual edit.
+#
+# Parameters (params.json, schema zrmd/font-params@1), in the order they are applied to each glyph:
+#   global.x_height_scale  lowercase points between baseline and x-height scale by k; above, they blend back to
+#                          the ascender so ascenders keep their height;
+#   global.overshoot_units round parts beyond the baseline, x-height and cap height grow by this many font units
+#                          (zero at the flat line, full at the band edge);
+#   global.weight_units    every point moves along its ink-growing normal (stroke width changes by twice this);
+#   global.contrast_units  extra normal offset times (|nx| - |ny|): vertical stems thicken, horizontals thin;
+#   glyphs.<name>.scale_x  horizontal scale about x = 0, with the advance;
+#   glyphs.<name>.advance_units  extra advance width (spacing is part of the font);
+#   glyphs.<name>.offsets  per-point residual offsets [dx, dy] in font units, regularised by smoothing along the
+#                          contour (the "point offsets regularised by smoothness" of the F1 brief).
+#   layout                 size, origin, tracking of the line, so the reference crop is reproduced exactly.
+# Residual offsets are fitted by snapping the outline: every on-curve point moves along its normal by the edge
+# displacement read under it (the area difference between reference and render on a strip across the edge); an
+# off-curve point moves by the displacement read at its curve midpoint. Steps are damped, smoothed and kept only when the loss improves
+# (porte locale of zenray-height).
+# Defaults live in settings.json, section "vector.create" (HDA law).
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+from zrmd import settings
+from zrmd.vector import fontfit as FF
+from zrmd.vector import render as R
+
+SCHEMA = "zrmd/font-params@1"
+
+
+def _cfg() -> dict:
+    return settings.get("vector.create")
+
+
+# ---------------------------------------------------------------- base instance (12 October 2026)
+
+def instance_base(font_file: str, axes: dict, out_file: Path) -> Path:
+    """Static glyf instance of a font at axes, written to out_file (deterministic: fixed head timestamps)."""
+    from fontTools.ttLib import TTFont
+    from fontTools.varLib import instancer
+    tt = TTFont(font_file, recalcTimestamp=False)
+    if "glyf" not in tt:
+        raise ValueError(f"{Path(font_file).name} is a CFF font; the creator edits glyf (TrueType) outlines only")
+    if "fvar" in tt:
+        known = {a.axisTag for a in tt["fvar"].axes}
+        loc = {k: float(v) for k, v in (axes or {}).items() if k in known}
+        tt = instancer.instantiateVariableFont(tt, loc, inplace=False)
+    _fix_timestamps(tt)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    tt.save(str(out_file))
+    return out_file
+
+
+def _fix_timestamps(tt) -> None:
+    epoch = _cfg()["head_timestamp"]
+    tt["head"].created = epoch
+    tt["head"].modified = epoch
+
+
+class Glyphs:
+    """Point data of the glyphs a string uses, in font units, from a static glyf font."""
+
+    def __init__(self, font_file: str, names: list[str]):
+        from fontTools.ttLib import TTFont
+        self.tt = TTFont(font_file, recalcTimestamp=False)
+        glyf = self.tt["glyf"]
+        hmtx = self.tt["hmtx"]
+        self.upem = self.tt["head"].unitsPerEm
+        os2 = self.tt["OS/2"]
+        self.x_height = float(getattr(os2, "sxHeight", 0) or 0)
+        self.cap_height = float(getattr(os2, "sCapHeight", 0) or 0)
+        self.ascender = float(self.tt["hhea"].ascent)
+        cmap = self.tt.getBestCmap() or {}
+        lower = {gn for cp, gn in cmap.items() if chr(cp).islower()}
+        self.data = {}
+        for n in dict.fromkeys(names):
+            g = glyf[n]
+            coords, ends, flags = g.getCoordinates(glyf)
+            pts = np.array(coords, float).reshape(-1, 2) if len(coords) else np.zeros((0, 2))
+            self.data[n] = {"pts": pts, "ends": [int(e) for e in ends], "on": np.array([f & 1 for f in flags], bool),
+                            "advance": float(hmtx[n][0]), "lower": n in lower}
+
+    def contours(self, name: str):
+        start = 0
+        for e in self.data[name]["ends"]:
+            yield start, e + 1
+            start = e + 1
+
+
+# ---------------------------------------------------------------- geometry (12 October 2026)
+
+def _normals(pts: np.ndarray, start: int, end: int, grow_left: bool) -> np.ndarray:
+    seg = pts[start:end]
+    t = np.roll(seg, -1, axis=0) - np.roll(seg, 1, axis=0)
+    ln = np.stack([-t[:, 1], t[:, 0]], axis=1)
+    ln /= np.maximum(np.linalg.norm(ln, axis=1, keepdims=True), 1e-9)
+    return ln if grow_left else -ln
+
+
+def _area(seg: np.ndarray) -> float:
+    x, y = seg[:, 0], seg[:, 1]
+    return 0.5 * float((x * np.roll(y, -1) - np.roll(x, -1) * y).sum())
+
+
+def _grow_left(G: Glyphs, name: str) -> bool:
+    """TrueType contours keep ink on the right of travel (outer contours clockwise, negative area in y up), so the
+    ink-growing normal is the left normal; a glyph converted from PostScript keeps ink on the left. Read from the
+    sign of the largest contour."""
+    d = G.data[name]
+    best, area = 0.0, 0.0
+    for s, e in G.contours(name):
+        a = _area(d["pts"][s:e])
+        if abs(a) > best:
+            best, area = abs(a), a
+    return area < 0
+
+
+def _zones(G: Glyphs, lower: bool) -> list[float]:
+    return [0.0, G.x_height] if lower else [0.0, G.cap_height]
+
+
+def transform(G: Glyphs, name: str, P: dict, with_offsets: bool = True) -> np.ndarray:
+    """Apply the parameters to one glyph: x-height map, overshoot, weight and contrast normal offsets, scale_x,
+    residual offsets. Returns new points (font units)."""
+    d = G.data[name]
+    pts = d["pts"].copy()
+    if len(pts) == 0:
+        return pts
+    g = P["global"]
+    gp = P["glyphs"].get(name, {})
+    y = pts[:, 1]
+    if d["lower"] and G.x_height > 0:
+        k, xh, asc = g["x_height_scale"], G.x_height, max(G.ascender, G.x_height * 1.5)
+        mid = (y > 0) & (y <= xh)
+        hi = (y > xh) & (y < asc)
+        y2 = y.copy()
+        y2[mid] = y[mid] * k
+        y2[hi] = xh * k + (y[hi] - xh) * (asc - xh * k) / (asc - xh)
+        y = y2
+    o = g["overshoot_units"]
+    if o:
+        band = _cfg()["overshoot_band_em"] * G.upem
+        top = G.x_height * (g["x_height_scale"] if d["lower"] else 1.0) if d["lower"] else G.cap_height
+        y = y.copy()
+        above = (y > top) & (y <= top + band)
+        y[above] += o * (y[above] - top) / band
+        below = (y < 0) & (y >= -band)
+        y[below] += o * y[below] / band
+    pts[:, 1] = y
+    w, c = g["weight_units"], g["contrast_units"]
+    if w or c:
+        left = _grow_left(G, name)
+        out = pts.copy()
+        for s, e in G.contours(name):
+            n = _normals(pts, s, e, left)
+            off = w + c * (np.abs(n[:, 0]) - np.abs(n[:, 1]))
+            out[s:e] += n * off[:, None]
+        pts = out
+    pts[:, 0] *= gp.get("scale_x", 1.0)
+    if with_offsets and gp.get("offsets"):
+        pts += np.asarray(gp["offsets"], float).reshape(-1, 2)
+    return pts
+
+
+def contour_path(pts: np.ndarray, on: np.ndarray, dx: float, dy: float, s: float, digits: int) -> str:
+    """One TrueType contour (quadratic, implied on-curve midpoints) to the absolute M L Q Z dialect of
+    zrmd.vector.render, in pixels (y down): x_px = dx + x * s, y_px = dy - y * s."""
+    n = len(pts)
+    if n == 0:
+        return ""
+
+    def P(p):
+        return f"{round(dx + p[0] * s, digits):g} {round(dy - p[1] * s, digits):g}"
+    if on.any():
+        k0 = int(np.argmax(on))
+        seq = np.roll(pts, -k0, axis=0)
+        flg = np.roll(on, -k0)
+        start = seq[0]
+    else:
+        seq, flg = pts, on
+        start = (pts[-1] + pts[0]) / 2
+        seq = np.vstack([start, pts])
+        flg = np.concatenate([[True], on])
+        n += 1
+    parts = ["M" + P(start)]
+    prev_off = None
+    for k in range(1, n + 1):
+        p, o = seq[k % n], flg[k % n]
+        if k == n:
+            p, o = start, True
+        if o:
+            parts.append(("L" + P(p)) if prev_off is None else ("Q" + P(prev_off) + " " + P(p)))
+            prev_off = None
+        else:
+            if prev_off is not None:
+                m = (prev_off + p) / 2
+                parts.append("Q" + P(prev_off) + " " + P(m))
+            prev_off = p
+    parts.append("Z")
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------- layout and rendering (12 October 2026)
+
+def shape_names(font_file: str, text: str) -> tuple[list[str], list[float], list[float]]:
+    """Glyph names, pen x offsets (font units, with kerning) and advances (font units) of text in a static font."""
+    o = R.shape_text(text, font_file, R._face(str(font_file)).upem, None, 0.0, True)
+    names = [g["name"] for g in o.glyphs]
+    xs = [g["x"] for g in o.glyphs]
+    adv = [g["advance"] for g in o.glyphs]
+    return names, xs, adv
+
+
+def render_params(G: Glyphs, P: dict, seq: dict, canvas: tuple, with_offsets: bool = True) -> np.ndarray:
+    """Coverage mask of the string drawn from transformed glyph points (no font build), placed exactly as the
+    built font will be shaped: base advances with kerning, plus scale_x and advance_units changes, plus layout."""
+    L = P["layout"]
+    s = L["size"] / G.upem
+    digits = settings.get("vector.render.path_digits")
+    x = float(L["origin"][0])
+    y0 = float(L["origin"][1])
+    parts = []
+    track = L["tracking_em"] * L["size"]
+    deltas = L.get("deltas") or [0.0] * len(seq["names"])
+    for i, n in enumerate(seq["names"]):
+        d = G.data[n]
+        if len(d["pts"]):
+            pts = transform(G, n, P, with_offsets)
+            for a, b in G.contours(n):
+                parts.append(contour_path(pts[a:b], d["on"][a:b], x, y0, s, digits))
+        gp = P["glyphs"].get(n, {})
+        adv_change = d["advance"] * (gp.get("scale_x", 1.0) - 1.0) + gp.get("advance_units", 0.0)
+        x += (seq["advance"][i] + adv_change) * s + track + float(deltas[i])
+    rgba = R.fill_path(" ".join(p for p in parts if p), int(canvas[0]), int(canvas[1]))
+    m = rgba[..., 3].astype(np.float32) / 255.0
+    # 12 October 2026 (F3): optional optical softness of a video reference, layout.blur_px (unset = crisp, as F1).
+    b = float(L.get("blur_px") or 0.0)
+    return ndi_gaussian(m, b) if b > 0.05 else m
+
+
+def ndi_gaussian(m: np.ndarray, sigma: float) -> np.ndarray:
+    from scipy.ndimage import gaussian_filter
+    return gaussian_filter(m, sigma)
+
+
+# ---------------------------------------------------------------- fitting (12 October 2026)
+
+def signed_distance(ref: np.ndarray, threshold: float) -> np.ndarray:
+    """Signed distance (pixels, positive inside the ink) of a coverage mask, sub-pixel on partial pixels."""
+    from scipy.ndimage import distance_transform_edt
+    inside = ref >= threshold
+    sdf = np.where(inside, distance_transform_edt(inside) - 0.5, -(distance_transform_edt(~inside) - 0.5))
+    partial = (ref > 0.02) & (ref < 0.98)
+    sdf[partial] = ref[partial] - 0.5
+    return sdf.astype(np.float64)
+
+
+def _sample(sdf: np.ndarray, xy_px: np.ndarray) -> np.ndarray:
+    from scipy.ndimage import map_coordinates
+    # Pixel (c, r) covers [c, c + 1]; its centre is at c + 0.5.
+    return map_coordinates(sdf, [xy_px[:, 1] - 0.5, xy_px[:, 0] - 0.5], order=1, mode="nearest")
+
+
+def _sample_points(pts: np.ndarray, on: np.ndarray, s: int, e: int) -> tuple[np.ndarray, np.ndarray]:
+    """Where each point's position is read on the curve: itself if on-curve, the midpoint of its quadratic
+    (between its implied or real on-curve neighbours) if off-curve; and the gain of the move."""
+    seg, flg = pts[s:e], on[s:e]
+    prev, nxt = np.roll(seg, 1, axis=0), np.roll(seg, -1, axis=0)
+    pf, nf = np.roll(flg, 1), np.roll(flg, -1)
+    a = np.where(pf[:, None], prev, (prev + seg) / 2)
+    b = np.where(nf[:, None], nxt, (nxt + seg) / 2)
+    mid = 0.25 * a + 0.5 * seg + 0.25 * b
+    where = np.where(flg[:, None], seg, mid)
+    # An isolated control point moves its midpoint by half its own move, but its on-curve neighbours move too
+    # (each adds a quarter), so with neighbours moving alike the right gain is close to 1 (measured: gain 2
+    # oscillated and the step was rejected after two iterations). 12 October 2026.
+    gain = np.where(flg, 1.0, _cfg()["snap_off_gain"])
+    return where, gain
+
+
+def default_params(fit: dict, G: Glyphs, names: list[str]) -> dict:
+    """Identity parameters from a matcher fit: every adjustment at zero, layout from the fit, per-glyph advance
+    deltas of the matcher folded into font advances by glyph name (mean over occurrences)."""
+    p = fit["params"]
+    size = p["size"]
+    deltas = p.get("deltas") or [0.0] * len(names)
+    per = {}
+    for n, d in zip(names, deltas[:-1] + [0.0]):
+        per.setdefault(n, []).append(d)
+    glyphs = {}
+    for n in dict.fromkeys(names):
+        adv = float(np.mean(per.get(n, [0.0]))) * G.upem / size
+        glyphs[n] = {"scale_x": 1.0, "advance_units": round(adv, 3), "offsets": None}
+    # What the per-name mean cannot carry stays as a layout delta (zero when the spacing is consistent).
+    rest = [float(d) - glyphs[n]["advance_units"] * size / G.upem for n, d in zip(names, deltas[:-1] + [0.0])]
+    return {"schema": SCHEMA, "date": "12 October 2026",
+            "base": {"file": p["file"], "axes": p.get("axes") or {}, "family": fit.get("family")},
+            "global": {"weight_units": 0.0, "contrast_units": 0.0, "x_height_scale": 1.0, "overshoot_units": 0.0},
+            "glyphs": glyphs,
+            "layout": {"text": None, "size": size, "origin": list(p["origin"]), "tracking_em": p["tracking_em"],
+                       "deltas": [round(r, 4) for r in rest],
+                       "blur_px": float(p.get("blur_px") or 0.0)}}   # 12 October 2026 (F3): 0 for F1 fits
+
+
+def fit_font(ref: np.ndarray, text: str, fit: dict, work_dir: Path, enable: dict | None = None,
+             log=None) -> dict:
+    """Fit creator parameters from a matcher fit. enable switches stages off for the verifier (axes, globals,
+    spacing, offsets). Returns {params, score, trace, axes_search}.
+    The base location is refitted first: the matcher explains a heavier stroke by a heavier wght, while the
+    creator can explain it by weight_units, and the two are not the same shape (measured on Montserrat 480 with
+    +9 weight units: the matcher said wght 543 and the creator stalled at IoU 0.97 from there, 0.997 from 480).
+    Each axis of vector.create.fit_axes is searched on a grid of axis_grid values evaluated in parallel
+    (vector.create.workers), refined axis_levels times around the best; every evaluation re-instances the base and
+    fits globals and spacing; the offsets run once, at the best location."""
+    cfg = _cfg()
+    en = {"axes": True, "globals": True, "spacing": True, "offsets": True, **(enable or {})}
+    fit = copy.deepcopy(fit)
+    axes = dict(fit["params"].get("axes") or {})
+    ranges = {a["tag"]: a for a in R.font_axes(fit["params"]["file"])}
+    search = []
+    if en["axes"] and en["globals"]:
+        quick = {**en, "offsets": False}
+        for tag in [t for t in cfg["fit_axes"] if t in ranges and t in axes]:
+            lo, hi = ranges[tag]["min"], ranges[tag]["max"]
+            span = (hi - lo) * cfg["axis_span"]
+            centre = axes[tag]
+            for level in range(cfg["axis_levels"]):
+                values = sorted({round(float(min(hi, max(lo, v))), 3)
+                                 for v in np.linspace(centre - span, centre + span, cfg["axis_grid"])} | {centre})
+                jobs = []
+                for v in values:
+                    f2 = copy.deepcopy(fit)
+                    f2["params"]["axes"] = {**axes, tag: v}
+                    jobs.append((ref, text, f2, str(Path(work_dir) / f"axis-{tag}-{v:g}"), quick))
+                with ProcessPoolExecutor(cfg["workers"]) as pool:
+                    losses = list(pool.map(_axis_job, jobs))
+                for v, (loss, iou) in zip(values, losses):
+                    search.append({"axis": tag, "level": level, "value": v, "iou": iou, "loss": round(loss, 6)})
+                centre = values[int(np.argmin([l for l, _ in losses]))]
+                span = span * 2 / (cfg["axis_grid"] - 1)
+            if log:
+                log(f"axis {tag}: {axes[tag]} -> {centre}")
+            axes[tag] = centre
+        fit["params"]["axes"] = axes
+    out = _fit_at(ref, text, fit, work_dir, en, log)
+    out["axes_search"] = search
+    return out
+
+
+def create_font(ref: np.ndarray, text: str, match: dict, work_dir: Path, enable: dict | None = None,
+                starts: int | None = None, log=None) -> dict:
+    """Multi-start creator (12 October 2026). The family the matcher ranks first is not always the best start for
+    the creator: a modified font is explained by the matcher with a neighbour family whose outlines the creator
+    then cannot bend back (measured on the verifier target, Montserrat 480 with +9 weight units and x-height 1.05:
+    the matcher ranked Alexandria first and the creator stalled there at IoU 0.946). Every one of the first
+    vector.create.starts distinct families of the matcher fits is used as a start (TrueType outlines only), the
+    creator runs from each, and the best loss is kept; it stops early once a start reaches the match rule.
+    Returns the fit_font result of the best start plus a 'starts' log."""
+    cfg = _cfg()
+    n = starts or cfg["starts"]
+    seen, picks = set(), []
+    for f in match.get("fits") or []:
+        fam = f.get("family")
+        if fam in seen or "params" not in f:
+            continue
+        seen.add(fam)
+        picks.append(f)
+        if len(picks) >= n:
+            break
+    best, log_ = None, []
+    for k, f in enumerate(picks):
+        try:
+            r = fit_font(ref, text, f, Path(work_dir) / f"start-{k + 1:02d}", enable=enable, log=log)
+        except ValueError as exc:          # CFF font: the creator edits glyf outlines only
+            log_.append({"family": f.get("family"), "error": str(exc)})
+            continue
+        s = r["score"]
+        log_.append({"family": f.get("family"), "matcher_iou": f.get("iou"), "iou": s["iou"],
+                     "edge_mean": s["edge_mean"], "loss": round(s["loss"], 6)})
+        if log:
+            log(f"start {k + 1} {f.get('family')}: IoU {s['iou']}")
+        if best is None or s["loss"] < best["score"]["loss"]:
+            best = dict(r, start=f.get("family"))
+        if FF.is_match(s):
+            break
+    if best is None:
+        raise ValueError("no start font could be edited (every candidate is CFF or failed)")
+    best["starts"] = log_
+    return best
+
+
+def _axis_job(job: tuple) -> tuple:
+    ref, text, fit, work_dir, en = job
+    r = _fit_at(ref, text, fit, Path(work_dir), en, None)
+    return r["score"]["loss"], r["score"]["iou"]
+
+
+def _fit_at(ref: np.ndarray, text: str, fit: dict, work_dir: Path, en: dict, log=None) -> dict:
+    """Globals, spacing and offsets at the base location of fit (see fit_font)."""
+    from scipy.optimize import least_squares
+    cfg = _cfg()
+    base = instance_base(fit["params"]["file"], fit["params"].get("axes") or {}, Path(work_dir) / "base-instance.ttf")
+    names, xs, adv = shape_names(str(base), text)
+    G = Glyphs(str(base), names)
+    seq = {"names": names, "advance": adv}
+    P = default_params(fit, G, names)
+    P["layout"]["text"] = text
+    canvas = (ref.shape[1], ref.shape[0])
+    trace = []
+
+    def sc(stage):
+        s_ = FF.score(ref, render_params(G, P, seq, canvas))
+        trace.append({"stage": stage, **s_})
+        if log:
+            log(f"{stage}: IoU {s_['iou']} edge {s_['edge_mean']}")
+        return s_
+
+    sc("identity")
+    # 12 October 2026: coarse-to-fine blur per layout round (vector.create.layout_sigmas, falls back to sigma).
+    # The local least squares only see a misplaced glyph within about one blur radius, so a start whose line
+    # drifts by several pixels (size off by 1 percent on an 800 px line) stalled at IoU 0.75 with sigma 1.
+    st = {"sig": cfg["sigma"], "tgt": FF._blur(ref, cfg["sigma"]).ravel()}
+
+    def set_sigma(s_):
+        st["sig"] = float(s_)
+        st["tgt"] = FF._blur(ref, st["sig"]).ravel()
+
+    # 12 October 2026: globals and spacing alternate, spacing first. Measured on the verifier target from a
+    # Montserrat start re-instanced at wght 480 (the truth): the matcher placement belongs to wght 591, so the
+    # identity render sits at IoU 0.53 with every glyph misplaced; globals fitted first (with only the origin
+    # free) converged to x_height_scale 1.01 for a truth of 1.05 and spacing then could not undo it (0.924).
+    # Each stage now starts from the current values instead of resetting them, and the line size is a free
+    # layout parameter of the globals stage.
+    upx = cfg["global_unit_px"] / (P["layout"]["size"] / G.upem)
+
+    def fit_globals():
+        """Global parameters, line size and origin by least squares on the blurred residual."""
+        keys = [("weight_units", upx), ("contrast_units", upx), ("x_height_scale", upx / max(G.x_height, 1.0)),
+                ("overshoot_units", upx)]
+        g0 = dict(P["global"])
+        o0 = list(P["layout"]["origin"])
+        size0 = float(P["layout"]["size"])
+        su = cfg["global_unit_px"] * size0 / max(float(canvas[0]), 1.0)
+        if cfg.get("size_unit") == "cap":
+            # 12 October 2026: one size unit moves the cap top by global_unit_px, the same scale as the other
+            # globals (the canvas-width unit made size 70 times stiffer than x_height_scale, see F1 report).
+            su = cfg["global_unit_px"] * G.upem / max(G.cap_height or G.ascender, 1.0)
+
+        def put(v):
+            for (k, unit), x in zip(keys, v[:4]):
+                P["global"][k] = g0[k] + x * unit
+            P["layout"]["origin"] = [o0[0] + v[4] * cfg["global_unit_px"], o0[1] + v[5] * cfg["global_unit_px"]]
+            P["layout"]["size"] = size0 + v[6] * su
+
+        def resid(v):
+            put(v)
+            return FF._blur(render_params(G, P, seq, canvas, False), st["sig"]).ravel() - st["tgt"]
+
+        h = cfg["global_h"]
+
+        def jac(v):
+            cols = []
+            for i in range(v.size):
+                a_, b_ = v.copy(), v.copy()
+                a_[i] += h
+                b_[i] -= h
+                cols.append((resid(a_) - resid(b_)) / (2 * h))
+            resid(v)
+            return np.stack(cols, axis=1)
+        r = least_squares(resid, np.zeros(7), jac=jac, method="trf", max_nfev=cfg["global_nfev"], x_scale=cfg.get("global_x_scale", 1.0),
+                          xtol=1e-12, ftol=1e-12, gtol=1e-12)
+        put(r.x)
+        for k in P["global"]:
+            P["global"][k] = round(float(P["global"][k]), 4)
+        P["layout"]["size"] = round(float(P["layout"]["size"]), 5)
+
+    def fit_spacing():
+        """Per-name advance units and origin x by least squares (one parameter per distinct glyph name)."""
+        uniq = list(dict.fromkeys(names))
+        a0 = {n: P["glyphs"][n]["advance_units"] for n in uniq}
+        o0 = list(P["layout"]["origin"])
+
+        def put2(v):
+            for n, x in zip(uniq, v[:-1]):
+                P["glyphs"][n]["advance_units"] = a0[n] + x
+            P["layout"]["origin"] = [o0[0] + v[-1] * P["layout"]["size"] / G.upem, o0[1]]
+
+        def resid2(v):
+            put2(v)
+            return FF._blur(render_params(G, P, seq, canvas, False), st["sig"]).ravel() - st["tgt"]
+        h2 = cfg["global_unit_px"] / (P["layout"]["size"] / G.upem)
+
+        def jac2(v):
+            cols = []
+            for i in range(v.size):
+                a_, b_ = v.copy(), v.copy()
+                a_[i] += h2
+                b_[i] -= h2
+                cols.append((resid2(a_) - resid2(b_)) / (2 * h2))
+            resid2(v)
+            return np.stack(cols, axis=1)
+        r = least_squares(resid2, np.zeros(len(uniq) + 1), jac=jac2, method="trf", max_nfev=cfg["spacing_nfev"],
+                          x_scale=1.0, xtol=1e-12, ftol=1e-12, gtol=1e-12)
+        put2(r.x)
+        for n in uniq:
+            P["glyphs"][n]["advance_units"] = round(float(P["glyphs"][n]["advance_units"]), 3)
+
+    sigmas = cfg.get("layout_sigmas") or [cfg["sigma"]]
+    factors = cfg.get("size_starts") or [1.0]
+    rnd0 = 0
+    if len(factors) > 1 and en["globals"] and en["spacing"]:
+        # 12 October 2026: multi-start on the line size. The matcher size belongs to an unmodified font, and a
+        # changed x-height is first explained by a bigger size; the local least squares then stay in that basin
+        # (measured: size 91.84 for a truth of 90, x_height_scale 1.027 for 1.05, IoU 0.949). Each start scales
+        # the size by a factor and keeps the line length by compensating the tracking, runs the first layout
+        # round, and the best loss is kept.
+        P0 = copy.deepcopy(P)
+        n_g = len(names)
+        s0 = P0["layout"]["size"]
+        adv_sum = float(np.sum(seq["advance"])) * s0 / G.upem
+        best_p, best_s = None, None
+        for f_ in factors:
+            P.clear()
+            P.update(copy.deepcopy(P0))
+            sz = s0 * f_
+            P["layout"]["size"] = sz
+            P["layout"]["tracking_em"] = (adv_sum * (1 - f_) + n_g * P0["layout"]["tracking_em"] * s0) / (n_g * sz)
+            set_sigma(sigmas[0])
+            fit_spacing()
+            fit_globals()
+            s_ = FF.score(ref, render_params(G, P, seq, canvas, False))
+            if log:
+                log(f"size start x{f_}: IoU {s_['iou']}")
+            if best_s is None or s_["loss"] < best_s["loss"]:
+                best_p, best_s = copy.deepcopy(P), s_
+        P.clear()
+        P.update(best_p)
+        sc("size starts")
+        rnd0 = 1
+    for rnd in range(rnd0, cfg["layout_rounds"]):
+        set_sigma(sigmas[min(rnd, len(sigmas) - 1)])
+        if en["spacing"]:
+            fit_spacing()
+            sc("spacing" if rnd == 0 else f"spacing {rnd + 1}")
+        if en["globals"]:
+            fit_globals()
+            sc("globals" if rnd == 0 else f"globals {rnd + 1}")
+    # 3. residual point offsets by signed-distance snapping, damped, smoothed, kept only when the loss improves.
+    if en["offsets"]:
+        ts = np.arange(-cfg["strip_half_px"], cfg["strip_half_px"] + 1e-9, cfg["strip_step_px"])
+        uniq = [n for n in dict.fromkeys(names) if len(G.data[n]["pts"])]
+        for n in uniq:
+            P["glyphs"][n]["offsets"] = np.zeros_like(G.data[n]["pts"]).tolist()
+        damp = cfg["snap_damping"]
+        snaplog = []
+        best = FF.score(ref, render_params(G, P, seq, canvas))
+        s_px = P["layout"]["size"] / G.upem
+        for it in range(cfg["snap_iters"]):
+            # Edge displacement from the area difference along the normal: the ink the reference has and the
+            # render lacks, summed on a strip across the edge, is how far the edge must move (pixels). Unlike a
+            # signed distance of the reference alone, it reads the current render, so it corrects itself.
+            # Measured on a modified Montserrat: the signed distance snap added +0.004 IoU, this one ... (see F1).
+            cur = render_params(G, P, seq, canvas)
+            diff = (ref - cur).astype(np.float64)
+            acc = {n: np.zeros_like(G.data[n]["pts"]) for n in uniq}
+            cnt = {n: 0 for n in uniq}
+            L = P["layout"]
+            x = float(L["origin"][0])
+            track = L["tracking_em"] * L["size"]
+            deltas = L.get("deltas") or [0.0] * len(names)
+            for i, n in enumerate(names):
+                d = G.data[n]
+                if n in acc:
+                    pts = transform(G, n, P, True)
+                    left = _grow_left(G, n)
+                    for a, b in G.contours(n):
+                        where, gain = _sample_points(pts, d["on"], a, b)
+                        nrm = _normals(pts, a, b, left)
+                        px = np.stack([x + where[:, 0] * s_px, L["origin"][1] - where[:, 1] * s_px], axis=1)
+                        npx = np.stack([nrm[:, 0], -nrm[:, 1]], axis=1)   # normal in pixel axes (y down)
+                        area = np.zeros(len(px))
+                        for t in ts:
+                            area += _sample(diff, px + t * npx)
+                        dist = area * cfg["strip_step_px"] / s_px
+                        acc[n][a:b] += nrm * (gain * dist)[:, None]
+                    cnt[n] += 1
+                gp = P["glyphs"].get(n, {})
+                adv_change = d["advance"] * (gp.get("scale_x", 1.0) - 1.0) + gp.get("advance_units", 0.0)
+                x += (seq["advance"][i] + adv_change) * s_px + track + float(deltas[i])
+            old = copy.deepcopy({n: P["glyphs"][n]["offsets"] for n in uniq})
+            for n in uniq:
+                step = acc[n] / max(cnt[n], 1) * damp
+                for a, b in G.contours(n):
+                    seg = step[a:b]
+                    for _ in range(cfg["smooth_passes"]):
+                        seg = (1 - cfg["smooth_lambda"]) * seg + cfg["smooth_lambda"] * 0.5 * (
+                            np.roll(seg, 1, axis=0) + np.roll(seg, -1, axis=0))
+                    step[a:b] = seg
+                cap = cfg["snap_max_step_em"] * G.upem
+                norm = np.linalg.norm(step, axis=1, keepdims=True)
+                step = step * np.minimum(1.0, cap / np.maximum(norm, 1e-9))
+                P["glyphs"][n]["offsets"] = (np.asarray(old[n]) + step).tolist()
+            s_ = FF.score(ref, render_params(G, P, seq, canvas))
+            snaplog.append((it, round(damp, 4), s_["iou"], s_["loss"] < best["loss"]))
+            if s_["loss"] < best["loss"]:
+                best = s_
+            else:
+                for n in uniq:
+                    P["glyphs"][n]["offsets"] = old[n]
+                damp *= 0.5
+                if damp < cfg["snap_min_damping"]:
+                    break
+        for n in uniq:
+            P["glyphs"][n]["offsets"] = np.round(np.asarray(P["glyphs"][n]["offsets"]), 3).tolist()
+        sc("offsets")
+        trace[-1]["snap"] = {"iterations": len(snaplog), "accepted": sum(1 for r in snaplog if r[3]),
+                             "final_damping": round(damp, 4), "log": snaplog}
+    P["layout"]["origin"] = [round(float(v), 4) for v in P["layout"]["origin"]]
+    return {"params": P, "score": trace[-1], "trace": trace, "base_instance": str(base)}
+
+
+# ---------------------------------------------------------------- build (12 October 2026)
+
+def build_font(params: dict, out_file: Path, family_name: str) -> dict:
+    """Build the .ttf of params: instance the base, write transformed points of every adjusted glyph (composites
+    become simple glyphs), advances, and a new family name (an OFL Reserved Font Name is never reused).
+    Deterministic: two builds of the same params give the same bytes (sha256 returned)."""
+    from array import array
+    from fontTools.ttLib.tables import ttProgram
+    from fontTools.ttLib.tables._g_l_y_f import Glyph, GlyphCoordinates
+    import tempfile
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="zrmd-font-")) / "base.ttf"
+    instance_base(params["base"]["file"], params["base"]["axes"], tmp)
+    names = list(params["glyphs"])
+    G = Glyphs(str(tmp), names)
+    tt = G.tt
+    glyf, hmtx = tt["glyf"], tt["hmtx"]
+    for n in names:
+        d = G.data[n]
+        gp = params["glyphs"][n]
+        pts = transform(G, n, params, True)
+        g = Glyph()
+        if len(pts):
+            g.numberOfContours = len(d["ends"])
+            g.endPtsOfContours = list(d["ends"])
+            g.coordinates = GlyphCoordinates([(int(round(x)), int(round(y))) for x, y in pts])
+            g.flags = array("B", [int(f) for f in d["on"]])
+            g.program = ttProgram.Program()
+            g.program.fromBytecode(b"")
+        else:
+            g.numberOfContours = 0
+        glyf[n] = g
+        if len(pts):
+            g.recalcBounds(glyf)
+        advance = d["advance"] * gp.get("scale_x", 1.0) + gp.get("advance_units", 0.0)
+        hmtx[n] = (int(round(advance)), int(getattr(g, "xMin", 0)))
+    name = tt["name"]
+    ps = "".join(ch for ch in family_name if ch.isalnum())[:60]
+    for rec in list(name.names):
+        if rec.nameID in (1, 16):
+            rec.string = family_name
+        elif rec.nameID == 4:
+            rec.string = f"{family_name} Regular"
+        elif rec.nameID == 6:
+            rec.string = f"{ps}-Regular"
+        elif rec.nameID == 3:
+            rec.string = f"{ps};{params.get('date', '')}"
+    _fix_timestamps(tt)
+    tt.save(str(out_file))
+    tmp.unlink()
+    tmp.parent.rmdir()
+    data = out_file.read_bytes()
+    return {"file": str(out_file), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+
+
+def render_built(font_file: str, params: dict, canvas: tuple) -> np.ndarray:
+    """Render the string with the BUILT font through HarfBuzz (the real pipeline), with the layout parameters."""
+    L = params["layout"]
+    m = R.render_text_at(L["text"], font_file, L["size"], tuple(L["origin"]), canvas, None, L["tracking_em"],
+                         L.get("deltas"))
+    b = float(L.get("blur_px") or 0.0)            # 12 October 2026 (F3), see render_params
+    return ndi_gaussian(m, b) if b > 0.05 else m

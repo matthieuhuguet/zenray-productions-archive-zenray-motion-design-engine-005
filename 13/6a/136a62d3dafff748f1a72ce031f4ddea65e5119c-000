@@ -1,0 +1,916 @@
+# 12 October 2026, 19:00 CEST: F2 deterministic raster-to-vector tracer (written from the mathematics, no vendored code).
+# Pipeline: segment a crop into regions joined by small neighbour steps (a gradient stays one region, a hard or blurred
+# edge splits), absorb anti-aliasing slivers by a two-colour mixing test, fit each region's colour model (flat, linear
+# or radial gradient with stops), stack regions bottom to top by containment, compute each layer's soft coverage target
+# by projecting the pixel colour between the layer colour and the colour below, estimate a Gaussian blur from the edge
+# profile, extract sub-pixel contours, fit cubic Beziers (Schneider's method: corners, chord-length parameters, Newton
+# reparameterisation, split at the worst point, error bound in pixels), then refine every control point by least
+# squares on the rendered Skia coverage against the target. Defaults live in settings.json, section "vector.trace".
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from zrmd import settings
+
+
+def _cfg() -> dict:
+    return settings.get("vector.trace")
+
+
+# ---------------------------------------------------------------- segmentation (12 October 2026)
+
+def _smooth_components(img: np.ndarray, step: float) -> np.ndarray:
+    """Connected components of the 4-neighbour graph whose edges join pixels differing by at most step levels in
+    every channel; a gradient stays connected, an edge (hard, anti-aliased or blurred) is a cut."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    h, w, _ = img.shape
+    idx = np.arange(h * w).reshape(h, w)
+    dr = np.abs(img[:, 1:] - img[:, :-1]).max(-1) <= step
+    dd = np.abs(img[1:] - img[:-1]).max(-1) <= step
+    rows = np.concatenate([idx[:, :-1][dr], idx[:-1][dd]])
+    cols = np.concatenate([idx[:, 1:][dr], idx[1:][dd]])
+    g = coo_matrix((np.ones(len(rows), np.int8), (rows, cols)), shape=(h * w, h * w))
+    _, lab = connected_components(g, directed=False)
+    return lab.reshape(h, w).astype(np.int64)
+
+
+def _interior(lab: np.ndarray) -> np.ndarray:
+    """Pixels whose four neighbours share their label (border pixels count their missing neighbours as equal)."""
+    p = np.pad(lab, 1, mode="edge")
+    c = p[1:-1, 1:-1]
+    return (c == p[:-2, 1:-1]) & (c == p[2:, 1:-1]) & (c == p[1:-1, :-2]) & (c == p[1:-1, 2:])
+
+
+def _absorb_transitions(img: np.ndarray, lab: np.ndarray, cfg: dict) -> np.ndarray:
+    """Second pass for wide transitions (a blurred edge, a soft glow): every pixel outside the large regions is
+    tested as a mix of the nearest pixels of two large regions within blur_band_px; when the projection residual
+    is under aa_mix_tol it joins the side its mix weight favours. A thin feature with its own colour stays.
+    12 October 2026: measured on a disc blurred with sigma 3, the first pass alone left 19 ring fragments."""
+    from scipy import ndimage as ndi
+    h, w = lab.shape
+    ids, area = np.unique(lab, return_counts=True)
+    large = []
+    for u, a in zip(ids, area):
+        if a >= cfg["large_region_px"] and ndi.binary_erosion(lab == u, iterations=2).any():
+            large.append(int(u))
+    cand = ~np.isin(lab, large)
+    if not cand.any() or len(large) < 2:
+        return lab
+    reach = cfg["blur_band_px"]
+    near_d, near_c = [], []
+    keep = []
+    for u in large:
+        m = lab == u
+        d = ndi.distance_transform_edt(~m)
+        if not (d[cand] <= reach).any():
+            continue
+        # The colour of a side is read on its core (pixels at least core_depth_px inside), because a smooth region
+        # also swallows the outer tail of a blurred edge and its nearest pixel is then already a mix.
+        inside = ndi.distance_transform_edt(np.pad(m, 1, constant_values=True))[1:-1, 1:-1]
+        core = m & (inside >= min(cfg["core_depth_px"], inside[m].max()))
+        _, (iy, ix) = ndi.distance_transform_edt(~core, return_indices=True)
+        keep.append(u)
+        near_d.append(d)
+        near_c.append(img[iy, ix])
+    if len(keep) < 2:
+        return lab
+    yy, xx = np.nonzero(cand)
+    p = img[yy, xx]
+    best_res = np.full(len(yy), np.inf)
+    best_lab = np.full(len(yy), -1)
+    for i in range(len(keep)):
+        for j in range(i + 1, len(keep)):
+            ok = (near_d[i][yy, xx] <= reach) & (near_d[j][yy, xx] <= reach)
+            if not ok.any():
+                continue
+            ca, cb = near_c[i][yy, xx], near_c[j][yy, xx]
+            seg = ca - cb
+            n2 = (seg ** 2).sum(-1)
+            t = np.clip(((p - cb) * seg).sum(-1) / np.maximum(n2, 1e-9), 0, 1)
+            res = np.abs(cb + t[:, None] * seg - p).max(-1)
+            res = np.where(ok & (np.sqrt(n2) >= cfg["min_edge_contrast"]), res, np.inf)
+            better = res < best_res
+            best_res = np.where(better, res, best_res)
+            best_lab = np.where(better, np.where(t >= 0.5, keep[i], keep[j]), best_lab)
+    take = best_res <= cfg["aa_mix_tol"]
+    out = lab.copy()
+    out[yy[take], xx[take]] = best_lab[take]
+    return out
+
+
+def segment(rgb: np.ndarray, cfg: dict | None = None) -> dict:
+    """Label map of a crop: {labels (H, W) int32 0..n-1, n, aa (bool map of pixels explained as two-colour mixes)}.
+    A component is solid when it has at least min_region_px pixels and a non-empty interior; the other pixels are
+    tested as anti-aliasing mixes of the two nearest solid colours in a window, and absorbed by the nearest colour."""
+    cfg = cfg or _cfg()
+    img = np.asarray(rgb, np.float32)[..., :3]
+    h, w, _ = img.shape
+    lab = _smooth_components(img, cfg["smooth_step"])
+    inner = _interior(lab)
+    area = np.bincount(lab.ravel())
+    inner_n = np.bincount(lab[inner], minlength=len(area))
+    solid_lab = (area >= cfg["min_region_px"]) & (inner_n > 0)
+    solid = solid_lab[lab]
+    r = int(cfg["aa_window"])
+    best_d = np.full((h, w), np.inf, np.float32)
+    best_l = np.full((h, w), -1, np.int64)
+    best_c = np.zeros((h, w, 3), np.float32)
+    pad_img = np.pad(img, ((r, r), (r, r), (0, 0)), mode="edge")
+    pad_lab = np.pad(lab, r, mode="constant", constant_values=-1)
+    pad_sol = np.pad(solid, r, mode="constant", constant_values=False)
+    offsets = [(dy, dx) for dy in range(-r, r + 1) for dx in range(-r, r + 1) if (dy, dx) != (0, 0)]
+    shifted = []
+    for dy, dx in offsets:
+        sl = (slice(r + dy, r + dy + h), slice(r + dx, r + dx + w))
+        c, l_, s = pad_img[sl], pad_lab[sl], pad_sol[sl]
+        shifted.append((c, l_, s))
+        d = np.abs(c - img).max(-1) + 0.01 * math.hypot(dy, dx)
+        d = np.where(s, d, np.inf)
+        better = d < best_d
+        best_d = np.where(better, d, best_d)
+        best_l = np.where(better, l_, best_l)
+        best_c = np.where(better[..., None], c, best_c)
+    # Second colour: the solid neighbour of another label that best explains the pixel as a mix with the first.
+    best_res = np.full((h, w), np.inf, np.float32)
+    for c, l_, s in shifted:
+        ok = s & (l_ != best_l) & (l_ >= 0)
+        seg = c - best_c
+        n2 = (seg ** 2).sum(-1)
+        t = np.clip(((img - best_c) * seg).sum(-1) / np.maximum(n2, 1e-6), 0.0, 1.0)
+        res = np.abs(best_c + t[..., None] * seg - img).max(-1)
+        res = np.where(ok & (n2 > 1.0), res, np.inf)
+        best_res = np.minimum(best_res, res)
+    aa = (~solid) & (best_l >= 0) & (best_res <= cfg["aa_mix_tol"])
+    out = lab.copy()
+    out[aa] = best_l[aa]
+    # Thin pixels that are not mixes stay their own feature unless the feature is too small to be one.
+    rest = (~solid) & (~aa)
+    if rest.any():
+        from scipy import ndimage as ndi
+        comp, n = ndi.label(rest)
+        sizes = np.bincount(comp.ravel())
+        tiny = (sizes < cfg["min_region_px"])[comp] & rest
+        fallback = np.where(best_l >= 0, best_l, out)
+        out[tiny] = fallback[tiny]
+        keep = rest & ~tiny
+        if keep.any():
+            out[keep] = lab.max() + 1 + comp[keep]
+    out = _absorb_transitions(img, out, cfg)
+    # Relabel and split each label into 4-connected parts (an absorbed sliver may bridge nothing new).
+    from scipy import ndimage as ndi
+    final = np.full((h, w), -1, np.int64)
+    k = 0
+    for u in np.unique(out):
+        comp, n = ndi.label(out == u)
+        for j in range(1, n + 1):
+            final[comp == j] = k
+            k += 1
+    return {"labels": final.astype(np.int32), "n": k, "aa": aa}
+
+
+# ---------------------------------------------------------------- colour models (12 October 2026)
+
+def _centres(h: int, w: int):
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
+    return xs + 0.5, ys + 0.5
+
+
+def _hat_basis(t: np.ndarray, k: int) -> np.ndarray:
+    """Piecewise-linear interpolation basis on k uniform stops over t in [0, 1] (clamped, like SVG spread pad)."""
+    t = np.clip(t, 0.0, 1.0) * (k - 1)
+    i = np.minimum(np.floor(t).astype(int), k - 2)
+    f = t - i
+    b = np.zeros((len(t), k))
+    b[np.arange(len(t)), i] = 1 - f
+    b[np.arange(len(t)), i + 1] += f
+    return b
+
+
+def _fit_stops(t: np.ndarray, col: np.ndarray, k: int) -> tuple[np.ndarray, float]:
+    b = _hat_basis(t, k)
+    stops, *_ = np.linalg.lstsq(b, col, rcond=None)
+    res = b @ stops - col
+    return stops, float(np.sqrt((res ** 2).mean()))
+
+
+def _simplify_stops(offsets: np.ndarray, stops: np.ndarray, tol: float) -> list[dict]:
+    """Drop stops that linear interpolation of their neighbours reproduces within tol levels (editable stop list)."""
+    keep = list(range(len(offsets)))
+    changed = True
+    while changed and len(keep) > 2:
+        changed = False
+        best, best_err = None, None
+        for j in range(1, len(keep) - 1):
+            a, m, b = keep[j - 1], keep[j], keep[j + 1]
+            f = (offsets[m] - offsets[a]) / max(offsets[b] - offsets[a], 1e-9)
+            err = np.abs(stops[a] + f * (stops[b] - stops[a]) - stops[m]).max()
+            # every dropped stop between a and b must still be reproduced
+            if err <= tol and (best_err is None or err < best_err):
+                best, best_err = j, err
+        if best is not None:
+            keep.pop(best)
+            changed = True
+    return [{"offset": round(float(offsets[i]), 5), "colour": _hex(stops[i])} for i in keep]
+
+
+def _hex(c) -> str:
+    c = np.clip(np.round(np.asarray(c, float)), 0, 255).astype(int)
+    return "#%02x%02x%02x" % tuple(c[:3])
+
+
+def hex_rgb(h: str) -> np.ndarray:
+    h = h.lstrip("#")
+    return np.array([int(h[i:i + 2], 16) for i in (0, 2, 4)], np.float64)
+
+
+def fit_colour_model(rgb: np.ndarray, region: np.ndarray, cfg: dict | None = None) -> dict:
+    """Colour model of a region, fitted on its core (pixels farther than the blur band from the region edge when
+    enough remain, so a blurred neighbour does not bias it): flat, linear gradient or radial gradient, whichever is
+    simplest within the RMS bounds. Gradient stops are fitted densely on uniform offsets, then simplified."""
+    from scipy import ndimage as ndi
+    cfg = cfg or _cfg()
+    img = np.asarray(rgb, np.float64)[..., :3]
+    h, w, _ = img.shape
+    dist = ndi.distance_transform_edt(np.pad(region, 1))[1:-1, 1:-1]
+    core = region & (dist > min(cfg["blur_band_px"], 0.5 * dist.max()))
+    if core.sum() < 8:
+        core = region & (dist > 1) if (region & (dist > 1)).sum() >= 8 else region
+    xs, ys = _centres(h, w)
+    px, py, col = xs[core], ys[core], img[core]
+    rng = np.random.default_rng(0)
+    if len(px) > cfg["model_max_px"]:
+        sel = rng.choice(len(px), cfg["model_max_px"], replace=False)
+        px, py, col = px[sel], py[sel], col[sel]
+    mean = col.mean(0)
+    flat_rms = float(np.sqrt(((col - mean) ** 2).mean()))
+    flat = {"type": "flat", "colour": _hex(mean), "rms": round(flat_rms, 3)}
+    if flat_rms <= cfg["flat_rms_max"] or len(px) < 16:
+        return flat
+    # 12 October 2026: a gradient is fitted on a shallow core (only the anti-aliased rim removed), otherwise the
+    # outer stops are unconstrained (measured: a radial disc rendered black at its rim, colour p99 96 levels).
+    shallow = region & (dist > cfg["gradient_core_px"])
+    if shallow.sum() >= 16:
+        px, py, col = xs[shallow], ys[shallow], img[shallow]
+        if len(px) > cfg["model_max_px"]:
+            sel = rng.choice(len(px), cfg["model_max_px"], replace=False)
+            px, py, col = px[sel], py[sel], col[sel]
+    k = int(cfg["gradient_stops_max"])
+    tol = cfg["stop_simplify_levels"]
+    rx_all, ry_all = xs[region], ys[region]
+    # Linear: direction from the planar fit (principal direction of the 3x2 colour gradient), stops along it.
+    a = np.stack([np.ones_like(px), px, py], 1)
+    coef, *_ = np.linalg.lstsq(a, col, rcond=None)
+    g = coef[1:].T                                     # 3 x 2
+    _, _, vt = np.linalg.svd(g)
+    u = vt[0] / np.linalg.norm(vt[0])
+    tr = rx_all * u[0] + ry_all * u[1]
+    t0, t1 = float(tr.min()), float(tr.max())
+    tt = (px * u[0] + py * u[1] - t0) / max(t1 - t0, 1e-9)
+    lstops, lrms = _fit_stops(tt, col, k)
+    vproj = float((rx_all * -u[1] + ry_all * u[0]).mean())
+    p1 = u * t0 + np.array([-u[1], u[0]]) * vproj
+    p2 = u * t1 + np.array([-u[1], u[0]]) * vproj
+    linear = {"type": "linear", "x1": round(float(p1[0]), 3), "y1": round(float(p1[1]), 3),
+              "x2": round(float(p2[0]), 3), "y2": round(float(p2[1]), 3),
+              "stops": _simplify_stops(np.linspace(0, 1, k), lstops, tol), "rms": round(lrms, 3)}
+    # Radial: centre by a coarse grid then least squares, radius = farthest region pixel, stops along r / R.
+    from scipy.optimize import least_squares
+
+    def radial_res(c):
+        r = np.hypot(px - c[0], py - c[1])
+        big = np.hypot(rx_all - c[0], ry_all - c[1]).max()
+        stops, _ = _fit_stops(r / max(big, 1e-9), col, k)
+        return (_hat_basis(r / max(big, 1e-9), k) @ stops - col).ravel()
+
+    x0, x1_, y0, y1_ = rx_all.min(), rx_all.max(), ry_all.min(), ry_all.max()
+    grid = [(x0 + (x1_ - x0) * i / 4, y0 + (y1_ - y0) * j / 4) for i in range(5) for j in range(5)]
+    start = min(grid, key=lambda c: float((radial_res(c) ** 2).mean()))
+    fit = least_squares(radial_res, np.array(start), diff_step=1e-3, max_nfev=60)
+    c = fit.x
+    big = float(np.hypot(rx_all - c[0], ry_all - c[1]).max())
+    rstops, rrms = _fit_stops(np.hypot(px - c[0], py - c[1]) / max(big, 1e-9), col, k)
+    radial = {"type": "radial", "cx": round(float(c[0]), 3), "cy": round(float(c[1]), 3), "r": round(big, 3),
+              "stops": _simplify_stops(np.linspace(0, 1, k), rstops, tol), "rms": round(rrms, 3)}
+    best = min((linear, radial), key=lambda m: m["rms"])
+    if best["rms"] > cfg["gradient_rms_max"] and flat_rms <= best["rms"]:
+        return {**flat, "approx": True}
+    if best["rms"] > cfg["gradient_rms_max"]:
+        best = {**best, "approx": True}
+    return best
+
+
+def eval_model(model: dict, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    """Colour of a model at pixel-centre coordinates, shape (..., 3), float levels."""
+    if model["type"] == "flat":
+        return np.broadcast_to(hex_rgb(model["colour"]), xs.shape + (3,)).astype(np.float64)
+    if model["type"] == "linear":
+        d = np.array([model["x2"] - model["x1"], model["y2"] - model["y1"]])
+        t = ((xs - model["x1"]) * d[0] + (ys - model["y1"]) * d[1]) / max(float(d @ d), 1e-9)
+    else:
+        t = np.hypot(xs - model["cx"], ys - model["cy"]) / max(model["r"], 1e-9)
+    t = np.clip(t, 0, 1)
+    offs = np.array([s["offset"] for s in model["stops"]])
+    cols = np.array([hex_rgb(s["colour"]) for s in model["stops"]])
+    return np.stack([np.interp(t, offs, cols[:, ch]) for ch in range(3)], -1)
+
+
+# ---------------------------------------------------------------- stacking and coverage targets (12 October 2026)
+
+def stack_order(labels: np.ndarray, n: int, cfg: dict | None = None) -> dict:
+    """Bottom-to-top order by containment depth (a region inside another's filled outline is above it), then by
+    decreasing area; the region touching most of the canvas border is the background when it touches enough."""
+    from scipy import ndimage as ndi
+    cfg = cfg or _cfg()
+    h, w = labels.shape
+    area = np.bincount(labels.ravel(), minlength=n)
+    border = np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]])
+    bcount = np.bincount(border, minlength=n)
+    filled = [ndi.binary_fill_holes(labels == i) for i in range(n)]
+    depth = np.zeros(n, int)
+    for b in range(n):
+        mb = labels == b
+        for a in range(n):
+            # 12 October 2026: compare the filled area, so a thin ring still contains its larger inside.
+            if a != b and filled[a].sum() > area[b] and filled[a][mb].mean() >= cfg["containment_min"]:
+                depth[b] += 1
+    order = sorted(range(n), key=lambda i: (depth[i], -area[i]))
+    bg = int(np.argmax(bcount))
+    is_bg = bcount[bg] >= cfg["background_border_share"] * len(border) and depth[bg] == 0
+    if is_bg:
+        order.remove(bg)
+        order.insert(0, bg)
+    return {"order": order, "depth": depth.tolist(), "area": area.tolist(), "filled": filled,
+            "background": bg if is_bg else None}
+
+
+def merge_revealed(rgb: np.ndarray, labels: np.ndarray, models: dict, st: dict, cfg: dict | None = None) -> tuple:
+    """A region that only shows a lower region again (the counter of a glyph, the inside of a ring, a window in a
+    shape) is not a layer: when a lower and strictly shallower region's colour model reproduces its pixels within
+    hole_rms_max, it is relabelled as that region, so the shape above gets a real hole. 12 October 2026."""
+    cfg = cfg or _cfg()
+    img = np.asarray(rgb, np.float64)[..., :3]
+    h, w = labels.shape
+    xs, ys = _centres(h, w)
+    order, depth = st["order"], st["depth"]
+    out = labels.copy()
+    merged = {}
+    from scipy import ndimage as ndi
+    for pos, b in enumerate(order):
+        mb = labels == b
+        core = ndi.binary_erosion(mb, iterations=2)       # edge pixels carry the anti-aliasing mix, not the colour
+        if core.sum() >= 4:
+            mb = core
+        best, best_rms = None, None
+        for a in order[:pos]:
+            if depth[a] >= depth[b] or a in merged:
+                continue
+            col = eval_model(models[a], xs[mb], ys[mb])
+            rms = float(np.sqrt(((col - img[mb]) ** 2).mean()))
+            if rms <= cfg["hole_rms_max"] and (best_rms is None or rms < best_rms):
+                best, best_rms = a, rms
+        if best is not None:
+            out[labels == b] = best
+            merged[b] = best
+    if not merged:
+        return labels, models, merged
+    uniq = np.unique(out)
+    remap = np.full(int(labels.max()) + 1, -1)
+    remap[uniq] = np.arange(len(uniq))
+    new_models = {int(remap[u]): models[int(u)] for u in uniq}
+    return remap[out].astype(np.int32), new_models, merged
+
+
+def layer_target(rgb: np.ndarray, labels: np.ndarray, models: dict, order: list, idx: int, filled: list,
+                 cfg: dict | None = None, band: int | None = None) -> dict:
+    """Soft coverage target of layer order[idx]: 1 inside its stacked outline, 0 outside, and on the band around the
+    edge the projection of the pixel colour on the segment from the colour below to the layer's own colour (both
+    from the fitted models of the nearest regions). Pixels of upper layers that are not enclosed by this one get
+    weight 0, since the layer may continue under them."""
+    from scipy import ndimage as ndi
+    cfg = cfg or _cfg()
+    band = cfg["band_px"] if band is None else band
+    img = np.asarray(rgb, np.float64)[..., :3]
+    h, w = labels.shape
+    me = order[idx]
+    rank = np.empty(max(order) + 1, int)
+    rank[np.array(order)] = np.arange(len(order))
+    rank_map = rank[labels]
+    above = rank_map > idx
+    below = rank_map < idx
+    region = labels == me
+    # 12 October 2026: an upper region inside this layer's filled outline belongs to the stacked shape only when it
+    # sits on this layer, never when it touches a lower layer seen through a hole (the dot inside a ring sits on the
+    # gradient behind the ring, not on the ring; measured on the synthetic logo, counting it made the ring 22 px
+    # thick instead of 9 and it fell back to a free path at IoU 0.985).
+    cand = above & filled[me]
+    if cand.any():
+        comp, nc = ndi.label(cand)
+        ring = ndi.binary_dilation(cand) & ~cand & below
+        touching = np.unique(ndi.grey_dilation(comp, size=3)[ring])
+        cand &= ~np.isin(comp, touching[touching > 0])
+    stacked = region | cand
+    weight = np.where(above & ~stacked, 0.0, 1.0)
+    occl = above & ~stacked & ndi.binary_dilation(region, iterations=cfg["occlusion_extend_px"])
+    contour_mask = stacked | occl
+    xs, ys = _centres(h, w)
+    _, (iy, ix) = ndi.distance_transform_edt(~stacked, return_indices=True)
+    top_lab = labels[iy, ix]
+    low = below
+    if low.any():
+        _, (jy, jx) = ndi.distance_transform_edt(~low, return_indices=True)
+        low_lab = labels[jy, jx]
+    else:
+        low_lab = np.full_like(labels, -1)
+    d_in = ndi.distance_transform_edt(stacked)
+    d_out = ndi.distance_transform_edt(~stacked)
+    near = (np.where(stacked, d_in, d_out) <= band) & (weight > 0)   # 12 October 2026: distance to the own edge only
+    alpha = stacked.astype(np.float64)
+    if low.any() and near.any():
+        yy, xx = np.nonzero(near)
+        top = np.zeros((len(yy), 3))
+        bot = np.zeros((len(yy), 3))
+        for lab_id in np.unique(top_lab[yy, xx]):
+            s = top_lab[yy, xx] == lab_id
+            top[s] = eval_model(models[int(lab_id)], xs[yy, xx][s], ys[yy, xx][s])
+        for lab_id in np.unique(low_lab[yy, xx]):
+            s = low_lab[yy, xx] == lab_id
+            bot[s] = eval_model(models[int(lab_id)], xs[yy, xx][s], ys[yy, xx][s])
+        seg = top - bot
+        n2 = (seg ** 2).sum(-1)
+        t = ((img[yy, xx] - bot) * seg).sum(-1) / np.maximum(n2, 1e-9)
+        contrast = np.sqrt(n2) >= cfg["min_edge_contrast"]
+        alpha[yy, xx] = np.where(contrast, np.clip(t, 0, 1), alpha[yy, xx])
+    signed = np.where(stacked, d_in - 0.5, 0.5 - d_out)
+    return {"alpha": alpha, "weight": weight, "stacked": stacked, "contour_mask": contour_mask,
+            "signed_dist": signed}
+
+
+def estimate_blur(alpha: np.ndarray, weight: np.ndarray, signed: np.ndarray, cfg: dict | None = None) -> float:
+    """Gaussian blur sigma of an edge, from the probit of the coverage against the signed distance to the hard
+    edge: an erf edge of total sigma s has probit(alpha) = d / s; the anti-aliasing width (aa_sigma) is removed
+    in quadrature. Returns 0 for a sharp edge."""
+    from scipy.stats import norm
+    cfg = cfg or _cfg()
+    sel = (weight > 0) & (alpha > 0.03) & (alpha < 0.97) & (np.abs(signed) <= cfg["blur_band_px"])
+    if sel.sum() < 12:
+        return 0.0
+    z = norm.ppf(alpha[sel])
+    d = signed[sel]
+    a = np.stack([np.ones_like(d), d], 1)
+    (c0, slope), *_ = np.linalg.lstsq(a, z, rcond=None)
+    if slope <= 1e-6:
+        return 0.0
+    st = 1.0 / slope
+    s = math.sqrt(max(0.0, st * st - cfg["aa_sigma"] ** 2))
+    return round(s, 3) if s >= cfg["blur_min_sigma"] else 0.0
+
+
+# ---------------------------------------------------------------- contours (12 October 2026)
+
+def subpixel_contours(cov: np.ndarray, level: float = 0.5, min_area: float = 0.0) -> list[np.ndarray]:
+    """Closed sub-pixel contours of a coverage map in canvas coordinates (x, y), pixel centres at +0.5."""
+    from skimage import measure
+    p = np.pad(np.asarray(cov, np.float64), 1)
+    out = []
+    for c in measure.find_contours(p, level):
+        xy = np.stack([c[:, 1] - 1 + 0.5, c[:, 0] - 1 + 0.5], 1)
+        if len(xy) < 4:
+            continue
+        x, y = xy[:, 0], xy[:, 1]
+        a = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+        if a >= min_area:
+            out.append(xy[:-1] if np.allclose(xy[0], xy[-1]) else xy)
+    return out
+
+
+def resample(poly: np.ndarray, step: float, closed: bool = True) -> np.ndarray:
+    pts = np.vstack([poly, poly[:1]]) if closed else poly
+    seg = np.hypot(*np.diff(pts, axis=0).T)
+    s = np.concatenate([[0], np.cumsum(seg)])
+    total = s[-1]
+    if total <= 0:
+        return poly[:1]
+    n = max(4 if closed else 2, int(round(total / step)))
+    q = np.linspace(0, total, n, endpoint=not closed)
+    return np.stack([np.interp(q, s, pts[:, 0]), np.interp(q, s, pts[:, 1])], 1)
+
+
+# ---------------------------------------------------------------- cubic Bezier fitting (12 October 2026)
+
+def _bez(ctrl: np.ndarray, t: np.ndarray) -> np.ndarray:
+    t = t[:, None]
+    mt = 1 - t
+    return mt ** 3 * ctrl[0] + 3 * mt * mt * t * ctrl[1] + 3 * mt * t * t * ctrl[2] + t ** 3 * ctrl[3]
+
+
+def _bez_d1(ctrl, t):
+    t = t[:, None]
+    mt = 1 - t
+    return 3 * mt * mt * (ctrl[1] - ctrl[0]) + 6 * mt * t * (ctrl[2] - ctrl[1]) + 3 * t * t * (ctrl[3] - ctrl[2])
+
+
+def _bez_d2(ctrl, t):
+    t = t[:, None]
+    return 6 * (1 - t) * (ctrl[2] - 2 * ctrl[1] + ctrl[0]) + 6 * t * (ctrl[3] - 2 * ctrl[2] + ctrl[1])
+
+
+def _unit(v):
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-12 else v
+
+
+def _chord_params(pts):
+    d = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+    return d / d[-1] if d[-1] > 0 else np.linspace(0, 1, len(pts))
+
+
+def _generate(pts, u, t1, t2):
+    p0, p3 = pts[0], pts[-1]
+    b0, b1, b2, b3 = (1 - u) ** 3, 3 * u * (1 - u) ** 2, 3 * u * u * (1 - u), u ** 3
+    a1 = t1[None] * b1[:, None]
+    a2 = t2[None] * b2[:, None]
+    c = np.array([[(a1 * a1).sum(), (a1 * a2).sum()], [(a1 * a2).sum(), (a2 * a2).sum()]])
+    tmp = pts - (p0[None] * (b0 + b1)[:, None] + p3[None] * (b2 + b3)[:, None])
+    x = np.array([(a1 * tmp).sum(), (a2 * tmp).sum()])
+    det = c[0, 0] * c[1, 1] - c[0, 1] * c[1, 0]
+    seg = np.linalg.norm(p3 - p0)
+    if abs(det) > 1e-12:
+        al1 = (x[0] * c[1, 1] - x[1] * c[0, 1]) / det
+        al2 = (c[0, 0] * x[1] - c[1, 0] * x[0]) / det
+    else:
+        al1 = al2 = seg / 3
+    eps = 1e-6 * seg
+    if al1 < eps or al2 < eps:
+        al1 = al2 = seg / 3
+    return np.array([p0, p0 + t1 * al1, p3 + t2 * al2, p3])
+
+
+def _max_error(pts, ctrl, u):
+    d = np.hypot(*(_bez(ctrl, u) - pts).T)
+    i = int(np.argmax(d))
+    return float(d[i]), i
+
+
+def _reparam(pts, ctrl, u):
+    q = _bez(ctrl, u) - pts
+    d1, d2 = _bez_d1(ctrl, u), _bez_d2(ctrl, u)
+    num = (q * d1).sum(1)
+    den = (d1 * d1).sum(1) + (q * d2).sum(1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        un = np.where(np.abs(den) > 1e-12, u - num / den, u)
+    un = np.clip(un, 0, 1)
+    return np.maximum.accumulate(un)
+
+
+def fit_cubic(pts: np.ndarray, t1: np.ndarray, t2: np.ndarray, err: float, iters: int, depth: int = 0) -> list:
+    """Schneider's recursive cubic fit of an ordered point run with end tangents t1 (forward at the start) and t2
+    (backward at the end); returns a list of 4x2 control arrays whose max distance to the points is <= err."""
+    if len(pts) == 2 or np.linalg.norm(pts[-1] - pts[0]) < 1e-9 and len(pts) < 3:
+        seg = np.linalg.norm(pts[-1] - pts[0]) / 3
+        return [np.array([pts[0], pts[0] + t1 * seg, pts[-1] + t2 * seg, pts[-1]])]
+    u = _chord_params(pts)
+    ctrl = _generate(pts, u, t1, t2)
+    e, split = _max_error(pts, ctrl, u)
+    if e <= err:
+        return [ctrl]
+    if e <= err * 4:
+        for _ in range(iters):
+            u = _reparam(pts, ctrl, u)
+            ctrl = _generate(pts, u, t1, t2)
+            e, split = _max_error(pts, ctrl, u)
+            if e <= err:
+                return [ctrl]
+    split = int(min(max(split, 1), len(pts) - 2))
+    if len(pts) < 4 or depth > 40:
+        return [ctrl]
+    tc = _unit(pts[split - 1] - pts[split + 1])
+    return (fit_cubic(pts[:split + 1], t1, tc, err, iters, depth + 1) +
+            fit_cubic(pts[split:], -tc, t2, err, iters, depth + 1))
+
+
+def _tangent(pts, i, direction, span, closed):
+    """One-sided unit tangent at point i, averaged over span points in direction +1 (forward) or -1 (backward)."""
+    n = len(pts)
+    acc = np.zeros(2)
+    for m in range(1, span + 1):
+        j = i + direction * m
+        if closed:
+            j %= n
+        elif j < 0 or j >= n:
+            break
+        acc += (pts[j] - pts[i]) / m
+    return _unit(acc)
+
+
+def detect_corners(pts: np.ndarray, closed: bool, span: int, angle_deg: float) -> list[int]:
+    """Indices where the turning angle between the incoming and outgoing chords over span points exceeds
+    angle_deg, keeping the local maximum within span."""
+    n = len(pts)
+    if n < 2 * span + 3:
+        return []
+    ang = np.zeros(n)
+    for i in range(n):
+        if not closed and (i < span or i >= n - span):
+            continue
+        a = pts[i] - pts[(i - span) % n]
+        b = pts[(i + span) % n] - pts[i]
+        c = np.dot(a, b) / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-12)
+        ang[i] = math.degrees(math.acos(max(-1.0, min(1.0, c))))
+    out = []
+    for i in range(n):
+        if ang[i] < angle_deg:
+            continue
+        nb = [ang[(i + k) % n] for k in range(-span, span + 1) if closed or 0 <= i + k < n]
+        if ang[i] >= max(nb) and not any(abs(i - j) <= span or (closed and n - abs(i - j) <= span) for j in out):
+            out.append(i)
+    return out
+
+
+def fit_contour(poly: np.ndarray, closed: bool = True, cfg: dict | None = None, err: float | None = None) -> list:
+    """Cubic segments of one contour: resample, split at corners, fit each run with Schneider's method."""
+    cfg = cfg or _cfg()
+    err = cfg["fit_error_px"] if err is None else err
+    step = cfg["resample_px"]
+    pts = resample(poly, step, closed)
+    span = max(2, int(round(cfg["corner_span_px"] / step)))
+    corners = detect_corners(pts, closed, span, cfg["corner_deg"])
+    n = len(pts)
+    segs = []
+    tspan = max(2, span // 2)
+    if closed:
+        if not corners:
+            # Smooth closed curve: start where the curvature is lowest, tangents continuous through the seam.
+            start = 0
+            run = np.vstack([pts[start:], pts[:start + 1]])
+            t1 = _tangent(pts, start, +1, tspan, True)
+            t1 = _unit(t1 - _tangent(pts, start, -1, tspan, True))
+            return fit_cubic(run, t1, -t1, err, cfg["fit_max_iter"])
+        cs = sorted(corners)
+        for k, a in enumerate(cs):
+            b = cs[(k + 1) % len(cs)]
+            run = pts[a:b + 1] if b > a else np.vstack([pts[a:], pts[:b + 1]])
+            if len(run) < 2:
+                continue
+            t1 = _tangent(pts, a, +1, min(tspan, len(run) - 1), True)
+            t2 = _tangent(pts, b, -1, min(tspan, len(run) - 1), True)
+            segs += fit_cubic(run, t1, t2, err, cfg["fit_max_iter"])
+        return segs
+    cuts = [0] + sorted(c for c in corners if 0 < c < n - 1) + [n - 1]
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        run = pts[a:b + 1]
+        t1 = _tangent(pts, a, +1, min(tspan, len(run) - 1), False)
+        t2 = _tangent(pts, b, -1, min(tspan, len(run) - 1), False)
+        segs += fit_cubic(run, t1, t2, err, cfg["fit_max_iter"])
+    return segs
+
+
+def segments_to_d(contours: list[list[np.ndarray]], closed: bool = True, digits: int = 3) -> str:
+    """SVG path data (absolute M, C or Q, Z) of contours made of cubic (4 points) or quadratic (3 points) control
+    arrays (12 October 2026: quadratic segments added, see trace_layer)."""
+    def f(v):
+        return f"{round(float(v), digits):g}"
+    parts = []
+    for segs in contours:
+        if not segs:
+            continue
+        parts.append(f"M{f(segs[0][0][0])} {f(segs[0][0][1])}")
+        for s in segs:
+            parts.append(("C" if len(s) == 4 else "Q") + " ".join(f"{f(p[0])} {f(p[1])}" for p in s[1:]))
+        if closed:
+            parts.append("Z")
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------- raster refinement (12 October 2026)
+
+def _skia_path_from(contours: list[np.ndarray], closed: bool, even_odd: bool):
+    """contours: list of (n, 3, 2) cubic node arrays (anchor, handle out, handle in of the next anchor) or (n, 2, 2)
+    quadratic node arrays (anchor, control towards the next anchor); closed wraps."""
+    import skia
+    path = skia.Path()
+    for c in contours:
+        n = len(c)
+        if n == 0:
+            continue
+        path.moveTo(float(c[0, 0, 0]), float(c[0, 0, 1]))
+        last = n if closed else n - 1
+        for k in range(last):
+            nxt = c[(k + 1) % n, 0]
+            if c.shape[1] == 2:
+                path.quadTo(float(c[k, 1, 0]), float(c[k, 1, 1]), float(nxt[0]), float(nxt[1]))
+            else:
+                path.cubicTo(float(c[k, 1, 0]), float(c[k, 1, 1]), float(c[k, 2, 0]), float(c[k, 2, 1]),
+                             float(nxt[0]), float(nxt[1]))
+        if closed:
+            path.close()
+    path.setFillType(skia.PathFillType.kEvenOdd if even_odd else skia.PathFillType.kWinding)
+    return path
+
+
+def raster_path(path, w: int, h: int, dx: float = 0.0, dy: float = 0.0, blur: float = 0.0, stroke: dict | None = None,
+                ss: int = 1) -> np.ndarray:
+    """Coverage 0..1 of a skia.Path (filled, or stroked with {width, cap, join}) drawn with Skia analytic
+    anti-aliasing, optionally through the same Gaussian blur filter skia.SVGDOM applies for feGaussianBlur.
+    ss > 1 renders ss times larger and box-averages back: the curve flattening and the 8-bit coverage both become
+    ss times finer, which makes the fitting cost smooth (12 October 2026: measured on an arc, the 1x cost is bumpy
+    at 0.2 px, the 4x cost is convex); the last polish always runs at ss = 1, the renderer of the deliverable."""
+    import skia
+    info = skia.ImageInfo.Make(int(w) * ss, int(h) * ss, skia.ColorType.kRGBA_8888_ColorType,
+                               skia.AlphaType.kPremul_AlphaType)
+    surface = skia.Surface.MakeRaster(info)
+    canvas = surface.getCanvas()
+    canvas.clear(skia.Color(0, 0, 0, 0))
+    if ss > 1:
+        canvas.scale(ss, ss)
+    canvas.translate(dx, dy)
+    paint = skia.Paint(AntiAlias=True, Color=skia.Color(255, 255, 255, 255))
+    if stroke:
+        paint.setStyle(skia.Paint.kStroke_Style)
+        paint.setStrokeWidth(float(stroke["width"]))
+        paint.setStrokeCap({"butt": skia.Paint.kButt_Cap, "round": skia.Paint.kRound_Cap,
+                            "square": skia.Paint.kSquare_Cap}[stroke.get("cap", "butt")])
+        paint.setStrokeJoin({"miter": skia.Paint.kMiter_Join, "round": skia.Paint.kRound_Join,
+                             "bevel": skia.Paint.kBevel_Join}[stroke.get("join", "miter")])
+    if blur and blur > 0:
+        paint.setImageFilter(skia.ImageFilters.Blur(float(blur), float(blur)))
+    canvas.drawPath(path, paint)
+    arr = surface.makeImageSnapshot().toarray(colorType=skia.ColorType.kRGBA_8888_ColorType,
+                                              alphaType=skia.AlphaType.kUnpremul_AlphaType)
+    a = arr[..., 3].astype(np.float64) / 255.0
+    if ss > 1:
+        a = a.reshape(int(h), ss, int(w), ss).mean(axis=(1, 3))
+    return a
+
+
+def segs_to_nodes(segs: list[np.ndarray]) -> np.ndarray:
+    """(n, 3, 2) node array of a closed run of cubic segments: anchor, its outgoing handle, the incoming handle of the
+    next; (n, 2, 2) for quadratic segments: anchor and control (12 October 2026)."""
+    return np.array([list(s[:-1]) for s in segs], np.float64)
+
+
+def cubics_to_quads(segs: list[np.ndarray], max_err: float) -> list[np.ndarray]:
+    """Quadratic segments (3 points each) approximating cubic segments within max_err pixels, through fontTools'
+    cu2qu (MIT, used as a library). 12 October 2026: Skia's analytic anti-aliasing draws a quadratic closer to its
+    exact coverage than a cubic of the same shape; measured on the synthetic glyph 'a' (TrueType quadratics), the
+    exact outline drawn as quadratics reaches soft IoU 0.9996 against its own render, the same outline converted
+    to cubics only 0.9936, and splitting the cubics makes it worse (0.989), so the free path also exists as
+    quadratics. Chrome (HyperFrames) rasterises with Skia too."""
+    from fontTools.cu2qu import curve_to_quadratic
+    out = []
+    for s in segs:
+        spline = curve_to_quadratic([tuple(map(float, p)) for p in s], max_err, all_quadratic=True)
+        pts = [np.asarray(p, float) for p in spline]
+        # TrueType spline: on-curve points are implied midway between consecutive off-curve points.
+        offs = pts[1:-1]
+        start = pts[0]
+        for i, q in enumerate(offs):
+            end = pts[-1] if i == len(offs) - 1 else (q + offs[i + 1]) / 2
+            out.append(np.array([start, q, end]))
+            start = end
+    return out
+
+
+def nodes_to_segs(nodes: np.ndarray, closed: bool = True) -> list[np.ndarray]:
+    n = len(nodes)
+    last = n if closed else n - 1
+    return [np.array([*nodes[k], nodes[(k + 1) % n, 0]]) for k in range(last)]
+
+
+def refine_contours(contours: list[np.ndarray], target: np.ndarray, weight: np.ndarray, origin: tuple,
+                    blur: float = 0.0, cfg: dict | None = None, refine_blur: bool = False) -> dict:
+    """Least-squares refinement of every control point (and optionally the blur sigma) so the Skia coverage of
+    the even-odd path matches the target on the edge band. contours: list of (n, 3, 2) node arrays in canvas
+    coordinates; target and weight are crops whose top-left pixel sits at origin (x0, y0). The Jacobian is
+    sparse (a node only moves pixels near its two segments), so finite differences are grouped."""
+    from scipy import ndimage as ndi
+    from scipy.optimize import least_squares
+    from scipy.sparse import lil_matrix
+    cfg = cfg or _cfg()
+    rc = cfg["refine"]
+    h, w = target.shape
+    x0, y0 = origin
+    hard = target >= 0.5
+    reach = rc["band_px"] + int(math.ceil(3 * blur))
+    band = (ndi.binary_dilation(hard, iterations=reach) & ~ndi.binary_erosion(hard, iterations=reach, border_value=0)
+            & (weight > 0))
+    yy, xx = np.nonzero(band)
+    sizes = [len(c) for c in contours]
+    shapes = [c.shape for c in contours]                # (n, 3, 2) cubic or (n, 2, 2) quadratic (12 October 2026)
+    base = np.concatenate([c.reshape(-1) for c in contours]) if contours else np.zeros(0)
+    n_geo = len(base)
+    n_par = n_geo + (1 if refine_blur else 0)
+    tgt = target[yy, xx]
+    wt = weight[yy, xx]
+
+    def unpack(x):
+        x = x - 1.0                                    # offsets stored as 1 + delta (see primitives.fit)
+        flat = base + x[:n_geo]
+        out, k = [], 0
+        for shp in shapes:
+            m = int(np.prod(shp))
+            out.append(flat[k:k + m].reshape(shp))
+            k += m
+        b = blur + (x[n_geo] if refine_blur else 0.0)
+        return out, max(0.0, b)
+
+    stage = {"ss": 1}
+
+    def render(x):
+        cs, b = unpack(x)
+        return raster_path(_skia_path_from(cs, True, True), w, h, -x0, -y0, b, ss=stage["ss"])
+
+    def fun(x):
+        return (render(x)[yy, xx] - tgt) * wt
+
+    if len(yy) == 0 or n_par == 0:
+        return {"contours": contours, "blur": blur, "before": 0.0, "after": 0.0, "nfev": 0}
+    sp = lil_matrix((len(yy), n_par), dtype=np.int8)
+    margin = reach + 2
+    k = 0
+    for c in contours:
+        n = len(c)
+        per = int(np.prod(c.shape[1:]))                 # unknowns per node: 6 cubic, 4 quadratic
+        for i in range(n):
+            pts = np.vstack([c[(i - 1) % n], c[i], c[(i + 1) % n, :1]])
+            bx0, by0 = pts[:, 0].min() - x0 - margin, pts[:, 1].min() - y0 - margin
+            bx1, by1 = pts[:, 0].max() - x0 + margin, pts[:, 1].max() - y0 + margin
+            rows = np.nonzero((xx >= bx0) & (xx <= bx1) & (yy >= by0) & (yy <= by1))[0]
+            for j in range(per):
+                sp[rows, k + i * per + j] = 1
+        k += n * per
+    if refine_blur:
+        sp[:, n_geo] = 1
+    r0 = fun(np.ones(n_par))
+    x = np.ones(n_par)
+    nfev = 0
+    jsp = sp.tocsr()
+    for ss, step in rc["stages"]:
+        stage["ss"] = int(ss)
+        fit = least_squares(fun, x, jac_sparsity=jsp, diff_step=step, method="trf", max_nfev=rc["max_nfev"],
+                            x_scale=1.0, xtol=1e-12, ftol=1e-12)
+        x, nfev = fit.x, nfev + int(fit.nfev)
+    stage["ss"] = int(cfg.get("raster_ss", 1))         # 12 October 2026: polish on the reference rasteriser
+    if rc.get("compass_steps"):
+        # 12 October 2026: compass polish at ss = 1, the renderer of the deliverable. The least-squares stages
+        # converge on a smooth cost, but the edge pixels keep about +-0.15 of coverage that only the exact 1x
+        # rasterisation shows (measured on the glyph 'a': least squares alone stalls at soft IoU 0.9915).
+        from zrmd.vector.primitives import compass
+        x, n = compass(lambda z: float((fun(z) ** 2).sum()), x, rc["compass_steps"], rc.get("compass_sweeps", 2))
+        nfev += n
+    fit_fun = fun(x)
+    cs, b = unpack(x)
+    return {"contours": cs, "blur": round(b, 4), "before": float(np.sqrt((r0 ** 2).mean())),
+            "after": float(np.sqrt((fit_fun ** 2).mean())), "nfev": nfev}
+
+
+def trace_layer(target: np.ndarray, weight: np.ndarray, contour_mask: np.ndarray, origin: tuple, blur: float,
+                cfg: dict | None = None, refine: bool = True, degree: int | None = None) -> dict:
+    """Free-path vectorisation of one layer crop: sub-pixel contours of the target (don't-care pixels take the
+    stacked mask), Bezier fit, then raster refinement. Returns {d, nodes, blur, refine, degree, iou}.
+    12 October 2026: degree None measures both forms, cubic first; when the refined cubic path stays under
+    path_iou_goal, the same contours are converted to quadratics (cubics_to_quads) and refined again, and the form
+    with the higher soft IoU on the crop is kept (the choice and both scores are recorded)."""
+    from zrmd.vector import metrics as M
+    cfg = cfg or _cfg()
+    x0, y0 = origin
+    cov = np.where(weight > 0, target, contour_mask.astype(np.float64))
+    polys = subpixel_contours(cov, 0.5, cfg["contour_min_area"])
+    seg_runs = []
+    for p in polys:
+        segs = fit_contour(p + np.array([x0, y0]), True, cfg)
+        if segs:
+            seg_runs.append(segs)
+    h, w = target.shape
+
+    def run(deg: int) -> dict:
+        runs = seg_runs if deg == 3 else [cubics_to_quads(sg, cfg["quad_max_err_px"]) for sg in seg_runs]
+        contours = [segs_to_nodes(sg) for sg in runs]
+        b = blur
+        info = {"before": None, "after": None, "nfev": 0}
+        if refine and contours:
+            r = refine_contours(contours, target, weight, origin, b, cfg, refine_blur=b > 0)
+            contours, b = r["contours"], r["blur"]
+            if b < cfg["blur_min_sigma"]:
+                b = 0.0                                # 12 October 2026: a residual sigma under the threshold is no blur
+            info = {k: r[k] for k in ("before", "after", "nfev")}
+        iou = None
+        if contours:
+            c = raster_path(_skia_path_from(contours, True, True), w, h, -x0, -y0, b,
+                            ss=int(cfg.get("raster_ss", 1)))     # 12 October 2026: reference rasteriser
+            iou = M.weighted_iou(c, target, weight)
+        return {"contours": contours, "blur": b, "refine": info, "degree": deg, "iou": iou}
+
+    tried = []
+    if degree in (None, 3):
+        tried.append(run(3))
+    if degree == 2 or (degree is None and seg_runs and (tried[0]["iou"] or 0) < cfg["path_iou_goal"]):
+        tried.append(run(2))
+    best = max(tried, key=lambda t: t["iou"] if t["iou"] is not None else -1)
+    contours = best["contours"]
+    d = segments_to_d([nodes_to_segs(c) for c in contours], True, cfg["path_digits"])
+    return {"d": d, "nodes": [c.round(4).tolist() for c in contours], "blur": best["blur"], "refine": best["refine"],
+            "degree": best["degree"], "iou": best["iou"], "forms": {f"degree{t['degree']}": t["iou"] for t in tried},
+            "segments": int(sum(len(c) for c in contours))}

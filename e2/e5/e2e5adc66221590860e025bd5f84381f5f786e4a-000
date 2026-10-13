@@ -1,0 +1,229 @@
+# 12 October 2026: storyboard page of a reference (one card per shot) and the review contact sheets.
+# The page reads its thumbnails from the local reference cache by a relative path
+# (../../../tmp-zenray-motion-design-refcache/<slug>/storyboard/...); nothing of the reference is copied into the
+# workshop. Layout tokens live in one :root block (light and dark), InterVariable 400 for the interface and
+# AnthropicSerif 400 for every number; the page holds at 375 px without horizontal scroll (checked by
+# Scripts/CheckPageWidth.mjs in a headless chrome-headless-shell, never a personal browser).
+# FR : page storyboard d'une reference et planches de revue ; vignettes lues dans le cache local, jamais copiees.
+from __future__ import annotations
+
+import html
+import json
+import re
+from pathlib import Path
+
+import numpy as np
+
+from . import bible as B
+from . import settings
+from .analyze import easefit
+
+DATE = "12 October 2026"
+THUMB_REL = "../../../tmp-zenray-motion-design-refcache/{slug}/storyboard/{name}"
+INTER_REL = "../../ZenRayMotionDesign/fonts/InterVariable.ttf"
+SERIF_FILE = "file:///Users/zenray/Library/Fonts/AnthropicSerif-Regular.ttf"
+FAMILY_TOKEN = {"textcard": "--fam-text", "graphic": "--fam-graphic", "plate": "--fam-plate", "montage": "--fam-montage"}
+
+CSS = """
+@font-face { font-family: 'InterVariable'; src: url('%(inter)s') format('truetype'); font-weight: 100 900; }
+@font-face { font-family: 'AnthropicSerif'; src: local('AnthropicSerif-Regular'), local('Anthropic Serif'), url('%(serif)s') format('truetype'); font-weight: 400; }
+:root {
+  --zr-police-sans: 'InterVariable', 'Hiragino Sans W4', 'Hiragino Sans', sans-serif;
+  --zr-police-serif: 'AnthropicSerif', 'Hiragino Mincho ProN W3', serif;
+  --zr-poids-sans: 400; --zr-poids-nombres: 400;
+  --bg: #f6f5f2; --card: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db; --chip: #efede8;
+  --fam-text: #c96a3b; --fam-graphic: #3f7fbf; --fam-plate: #6b8f3a; --fam-montage: #8a5bb0;
+  --gutter: 16px; --radius: 12px; --gap: 14px; --size-ui: 14px; --size-small: 12.5px; --size-title: 22px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #161615; --card: #20201e; --ink: #ecebe7; --muted: #a3a29c; --line: #34332f; --chip: #2b2a27; } }
+:root[data-theme="dark"] { --bg: #161615; --card: #20201e; --ink: #ecebe7; --muted: #a3a29c; --line: #34332f; --chip: #2b2a27; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); }
+body { font-family: var(--zr-police-sans); font-weight: var(--zr-poids-sans); font-size: var(--size-ui); line-height: 1.45;
+  overflow-x: hidden; }
+main { max-width: 1280px; margin: 0 auto; padding: 20px var(--gutter) 48px; }
+h1 { font-family: var(--zr-police-serif); font-weight: 350; font-size: var(--size-title); margin: 0 0 6px; overflow-wrap: anywhere; }
+p.lead { color: var(--muted); margin: 0 0 14px; max-width: 72ch; }
+.num { font-family: var(--zr-police-serif); font-weight: var(--zr-poids-nombres); }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin: 0 0 14px; }
+.stat { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; min-width: 0; }
+.stat b { display: block; font-weight: 400; color: var(--muted); font-size: var(--size-small); }
+.stat .num { font-size: 18px; }
+.timeline { width: 100%%; height: 28px; display: block; margin: 0 0 6px; border-radius: 6px; overflow: hidden; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; color: var(--muted); font-size: var(--size-small); margin: 0 0 18px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%%, 320px), 1fr)); gap: var(--gap); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; min-width: 0; }
+.strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; background: var(--line); }
+.strip img { width: 100%%; height: auto; display: block; aspect-ratio: auto; }
+.body { padding: 10px 12px 12px; min-width: 0; }
+.head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; margin-bottom: 6px; }
+.sid { font-weight: 400; font-size: 15px; }
+.fam { font-size: var(--size-small); padding: 1px 8px; border-radius: 99px; color: #fff; }
+.times { color: var(--muted); font-size: var(--size-small); }
+.desc { margin: 0 0 8px; overflow-wrap: anywhere; }
+dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 10px; margin: 0; font-size: var(--size-small); }
+dt { color: var(--muted); }
+dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { background: var(--chip); border-radius: 6px; padding: 1px 6px; display: inline-flex; align-items: center; gap: 4px;
+  max-width: 100%%; overflow-wrap: anywhere; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--line); vertical-align: -2px; }
+svg.ease { width: 34px; height: 18px; flex: none; }
+svg.ease path { fill: none; stroke: currentColor; stroke-width: 1.6; }
+.phases { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 2px; margin-top: 8px; }
+.phases figure { margin: 0; min-width: 0; }
+.phases img { width: 100%%; display: block; border-radius: 3px; }
+.phases figcaption { font-size: 11px; color: var(--muted); }
+footer { margin-top: 28px; color: var(--muted); font-size: var(--size-small); overflow-wrap: anywhere; }
+"""
+
+
+def esc(v) -> str:
+    return html.escape(str(v), quote=True)
+
+
+def num(v, nd: int = 2) -> str:
+    return f'<span class="num">{esc(B.fr_num(v, nd))}</span>'
+
+
+def ease_svg(name: str) -> str:
+    """Small polyline of the ease shape (progress against time)."""
+    u = np.linspace(0, 1, 33)
+    try:
+        m = re.match(r"cubic-bezier\(([^)]*)\)", name)
+        if m:
+            y = easefit.cubic_bezier(u, *[float(x) for x in m.group(1).split(",")])
+        else:
+            y = easefit.default_library().evaluate(name, u)
+    except Exception:
+        return ""
+    lo, hi = min(0.0, float(y.min())), max(1.0, float(y.max()))
+    pts = " ".join(f"{1 + 32 * a:.1f},{17 - 16 * (b - lo) / (hi - lo):.1f}" for a, b in zip(u, y))
+    return f'<svg class="ease" viewBox="0 0 34 18" aria-hidden="true"><path d="M{pts.replace(" ", " L")}"/></svg>'
+
+
+def moves_html(s: dict) -> str:
+    chips = []
+    units = {"x": "% l.", "y": "% l.", "zoom": "%", "roll": "°", "scale": "", "opacity": ""}
+    for ch, row in s["camera"].get("channels", {}).items():
+        for tw in row.get("moves", []):
+            chips.append(f'<span class="chip">{ease_svg(tw["ease"])}image {esc(ch)} {esc(tw["ease"])} '
+                         f'{num(tw["duration"])} s</span>')
+    for el in s["elements"]:
+        for ch, tws in el["channels"].items():
+            for tw in tws:
+                chips.append(f'<span class="chip">{ease_svg(tw["ease"])}{esc(el["id"])} {esc(ch)} {esc(tw["ease"])} '
+                             f'{num(tw["duration"])} s</span>')
+    return '<div class="chips">' + "".join(chips) + "</div>" if chips else "aucune courbe fiable"
+
+
+def sound_html(s: dict) -> str:
+    snd = s.get("sound") or {}
+    chips = [f'<span class="chip">{num(e["t"])} s {esc(e["kind"])}{" (fort)" if e.get("main") else ""}</span>'
+             for e in snd.get("events", [])]
+    chips += [f'<span class="chip">{num(w["t"])} s houle {num(w["rise_s"])} s</span>' for w in snd.get("swells", [])]
+    return '<div class="chips">' + "".join(chips) + "</div>" if chips else "rien de saillant"
+
+
+def colours_html(s: dict) -> str:
+    names = {"background": "fond", "text": "texte", "accent": "accent"}
+    chips = []
+    for r, lab in names.items():
+        v = s["roles"].get(r)
+        if v:
+            chips.append(f'<span class="chip"><i class="sw" style="background:{esc(v)}"></i>{lab} {esc(v)}</span>')
+    for v in s["roles"].get("secondary", [])[:3]:
+        chips.append(f'<span class="chip"><i class="sw" style="background:{esc(v)}"></i>{esc(v)}</span>')
+    return '<div class="chips">' + "".join(chips) + "</div>"
+
+
+def card(s: dict, slug: str, desc: dict) -> str:
+    imgs = "".join(f'<img loading="lazy" src="{esc(THUMB_REL.format(slug=slug, name=s["thumbs"][k]))}" alt="{esc(s["id"])} {lab}" '
+                   f'width="480">' for k, lab in (("in", "début"), ("mid", "milieu"), ("out", "fin")))
+    fam = s["family"]
+    rows = [("entrée", esc(s.get("transition_in", {}).get("kind", ""))), ("couleurs", colours_html(s)),
+            ("image", esc(", ".join(s["camera"]["kind"])) + f' · sonde {esc(B.camera.CLASS_FR.get(s["camera"]["probe"]["class"], ""))}'),
+            ("courbes", moves_html(s))]
+    if s["text_lines"]:
+        tl = s["text_lines"][0]
+        rows.append(("texte", f'{len(s["text_lines"])} ligne(s), hauteur d\'x {num(tl["x_height_px1080"], 1)} px, {esc(tl["case"])}'))
+    rows.append(("sons", sound_html(s)))
+    dl = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
+    ph = ""
+    if s.get("phases") and len(s["phases"]) > 1:
+        ph = '<div class="phases">' + "".join(
+            f'<figure><img loading="lazy" src="{esc(THUMB_REL.format(slug=slug, name=p["thumb"]))}" alt="phase {i + 1}">'
+            f'<figcaption>{num(p["start"], 1)} s</figcaption></figure>' for i, p in enumerate(s["phases"])) + "</div>"
+    return (f'<article class="card" id="{esc(s["id"])}"><div class="strip">{imgs}</div><div class="body">'
+            f'<div class="head"><span class="sid">{esc(s["id"])}</span>'
+            f'<span class="fam" style="background:var({FAMILY_TOKEN[fam]})">{esc(B.FAMILY_FR[fam])}</span>'
+            f'<span class="times">{num(s["start"])} s, durée {num(s["duration"])} s</span></div>'
+            f'<p class="desc">{esc(B.description(s, desc))}</p><dl>{dl}</dl>{ph}</div></article>')
+
+
+def timeline_svg(b: dict) -> str:
+    total = b["summary"]["rhythm"]["duration"]
+    rects = "".join(f'<rect x="{1000 * s["start"] / total:.2f}" y="0" width="{max(1000 * s["duration"] / total, 0.6):.2f}" '
+                    f'height="28" style="fill:var({FAMILY_TOKEN[s["family"]]})"><title>{esc(s["id"])}</title></rect>'
+                    for s in b["shots"])
+    cuts = "".join(f'<line x1="{1000 * s["start"] / total:.2f}" x2="{1000 * s["start"] / total:.2f}" y1="0" y2="28" '
+                   f'style="stroke:var(--card);stroke-width:0.8"/>' for s in b["shots"][1:])
+    return f'<svg class="timeline" viewBox="0 0 1000 28" preserveAspectRatio="none" role="img" aria-label="Plans">{rects}{cuts}</svg>'
+
+
+def render(b: dict, desc: dict) -> str:
+    slug = b["slug"]
+    R = b["summary"]["rhythm"]
+    snd = b.get("sound") or {}
+    fam = b["summary"]["families_time_share"]
+    stats = [("Durée", f'{num(R["duration"])} s'), ("Plans", num(R["shots"], 0)), ("Coupes par minute", num(R["cuts_per_minute"], 1)),
+             ("Plan médian", f'{num(R["shot_median_s"])} s'), ("Tempo", f'{num(snd.get("tempo_bpm"), 1)} BPM' if snd else "sans son"),
+             ("Famille dominante", esc(B.FAMILY_FR[next(iter(fam))]))]
+    legend = "".join(f'<span><i style="background:var({FAMILY_TOKEN[k]})"></i>{esc(B.FAMILY_FR[k])} {num(100 * v, 0)} %</span>'
+                     for k, v in fam.items())
+    lead = esc(desc.get("reference") or "Storyboard mesuré plan par plan ; les descriptions paraphrasent ce que montre chaque plan.")
+    page = [
+        "<!doctype html>", '<html lang="fr"><head><meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>Storyboard {esc(slug)}</title>", f"<style>{CSS % {'inter': INTER_REL, 'serif': SERIF_FILE}}</style></head>",
+        f'<body><main><h1>Storyboard {esc(slug)}</h1><p class="lead">{lead}</p>',
+        '<div class="stats">' + "".join(f'<div class="stat"><b>{k}</b>{v}</div>' for k, v in stats) + "</div>",
+        timeline_svg(b), f'<div class="legend">{legend}</div>',
+        '<section class="grid">' + "".join(card(s, slug, desc) for s in b["shots"]) + "</section>",
+        f'<footer>Mesures zrmd.bible du {DATE}. Vignettes lues depuis le cache local de la référence, jamais copiées dans '
+        f'l\'atelier. Bible : <a href="bible.md">bible.md</a>, données : <a href="bible.json">bible.json</a>.</footer>',
+        "</main></body></html>"]
+    out = "\n".join(page)
+    return out.replace("—", ",").replace("–", ",")
+
+
+def write(slug: str) -> Path:
+    b = json.loads((B.REFERENCES / slug / "bible.json").read_text(encoding="utf-8"))
+    target = B.REFERENCES / slug / "storyboard.html"
+    target.write_text(render(b, B.load_descriptions(slug)), encoding="utf-8")
+    return target
+
+
+def review_sheets(slug: str, out_dir: str | Path, step_s: float = 0.25, cols: int = 10, rows: int = 8, thumb_w: int = 192) -> list[Path]:
+    """Contact sheets for the eye review (one image every step_s, shot starts marked by their id), written outside
+    the workshop (scratchpad). Uses zrmd.sheets.contact_sheet."""
+    from .sheets import contact_sheet
+    b = json.loads((B.REFERENCES / slug / "bible.json").read_text(encoding="utf-8"))
+    _, video = B.reference(slug)
+    total = b["summary"]["rhythm"]["duration"]
+    per = step_s * cols * rows
+    marks = {s["start"]: s["id"] for s in b["shots"]}
+    out = []
+    k = 0
+    t = 0.0
+    while t < total - 1e-6:
+        end = min(total, t + per)
+        p = Path(out_dir) / f"{slug}-{k + 1:02d}.jpg"
+        contact_sheet(video, p, start=t, end=end, step_s=step_s, cols=cols, thumb_w=thumb_w,
+                      marks={m: v for m, v in marks.items() if t - step_s / 2 <= m < end}, title=f"{slug} {t:.1f}-{end:.1f}s")
+        out.append(p)
+        k += 1
+        t = end
+    return out

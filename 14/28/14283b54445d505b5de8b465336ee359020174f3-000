@@ -1,0 +1,3 @@
+# 12 October 2026: vector harness of zrmd (F0). render.py turns SVG and glyph outlines into deterministic
+# anti-aliased masks and RGBA; metrics.py measures masks (IoU, chamfer edge distance, stroke widths,
+# vertical metrics, ink advances and kerning, stroke contrast, terminal angles). Nothing here reads reference pixels.

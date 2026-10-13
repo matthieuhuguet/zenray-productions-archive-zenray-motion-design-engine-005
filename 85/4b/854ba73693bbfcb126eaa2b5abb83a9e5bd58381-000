@@ -1,0 +1,582 @@
+# 12 October 2026, 19:00 CEST: font matcher of F1 (rank free families against a reference text crop, fit axes).
+# Method, as in zenray-height: the dataset of measured building blocks (datasets/fonts/features.jsonl) gives a
+# start, then a measured fitting loop renders the known string with HarfBuzz and Skia on the reference canvas and
+# minimises (1 - soft IoU) + w_edge * mean chamfer distance (zrmd.vector.metrics). Nothing is guessed:
+#   1. coarse, every usable font file: size from the ink height, wght from the measured stem through the file's
+#      stem curve, tracking from the ink width, origin from the ink box; one score per file;
+#   2. fine, the top_k files: Nelder-Mead on size, sub-pixel origin, tracking and every fitted axis present
+#      (wght, wdth, opsz, slnt) on blurred masks, then decoupled rounds: size and origin y on the row profile,
+#      one x shift per glyph (folded into tracking and per-glyph deltas), axes by bounded 1-D searches.
+# The reference is a coverage mask (ink 1, paper 0) on its own canvas; crop_to_mask turns a gray crop into one.
+# Defaults live in settings.json, section "vector.fit" (HDA law).
+from __future__ import annotations
+
+import json
+import math
+from concurrent.futures import ProcessPoolExecutor
+from functools import lru_cache
+from pathlib import Path
+
+import numpy as np
+
+from zrmd import settings
+from zrmd.vector import features as F
+from zrmd.vector import metrics as M
+from zrmd.vector import render as R
+
+FONTS = Path(__file__).resolve().parents[2] / "datasets" / "fonts"
+
+
+def _cfg() -> dict:
+    return settings.get("vector.fit")
+
+
+# ---------------------------------------------------------------- inputs (12 October 2026)
+
+def crop_to_mask(gray: np.ndarray, light_on_dark: bool = True) -> np.ndarray:
+    """Gray or RGB crop to ink coverage 0..1 with robust paper and ink levels (5th and 99.7th percentiles)."""
+    g = np.asarray(gray, np.float32)
+    if g.ndim == 3:
+        g = g[..., :3].mean(axis=2)
+    if not light_on_dark:
+        g = g.max() - g
+    lo, hi = np.percentile(g, 5), np.percentile(g, 99.7)
+    return np.clip((g - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+
+
+@lru_cache(maxsize=1)
+def feature_records() -> dict:
+    """features.jsonl keyed by file path (built by Scripts/BuildFontFeatures.py)."""
+    out = {}
+    path = FONTS / "features.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} is missing; run Scripts/BuildFontFeatures.py")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        r = json.loads(line)
+        out[r["file"]] = r
+    return out
+
+
+# ---------------------------------------------------------------- loss (12 October 2026)
+
+def score(ref: np.ndarray, mask: np.ndarray, w_edge: float | None = None) -> dict:
+    """Soft IoU, chamfer edge distance (pixels) and the scalar loss on one canvas (no re-alignment)."""
+    w_edge = _cfg()["w_edge"] if w_edge is None else w_edge
+    hi = float(np.maximum(ref, mask).sum())
+    soft = float(np.minimum(ref, mask).sum()) / hi if hi > 0 else 1.0
+    e = M.edge_distance(ref, mask)
+    edge_mean = min(e["mean"], 1e3)
+    return {"iou": round(soft, 6), "edge_mean": round(edge_mean, 4), "edge_p95": round(min(e["p95"], 1e3), 4),
+            "loss": (1.0 - soft) + w_edge * edge_mean}
+
+
+def is_match(s: dict, cfg: dict | None = None) -> bool:
+    m = (cfg or _cfg())["match"]
+    return s["iou"] >= m["iou_min"] and s["edge_mean"] <= m["edge_mean_max_px"]
+
+
+def render_fit(text: str, p: dict, canvas: tuple) -> np.ndarray:
+    """Render a fit parameter set {file, size, axes, tracking_em, origin, deltas} on a canvas (width, height)."""
+    return R.render_text_at(text, p["file"], p["size"], tuple(p["origin"]), canvas, p.get("axes") or None,
+                            p.get("tracking_em", 0.0), p.get("deltas"))
+
+
+# ---------------------------------------------------------------- coarse stage (12 October 2026)
+
+def _interp_wght(curve: list, stem_em: float) -> float | None:
+    """Invert a stem curve [[wght, stem_em], ...] (monotone in practice) at a target stem."""
+    pts = [(w, s) for w, s in curve if w is not None and s is not None]
+    if len(pts) < 2:
+        return None
+    ws = np.array([p[0] for p in pts], float)
+    ss = np.array([p[1] for p in pts], float)
+    order = np.argsort(ss)
+    return float(np.interp(stem_em, ss[order], ws[order]))
+
+
+def _probe(text: str, file: str, size: float, axes: dict, tracking: float = 0.0) -> tuple:
+    """Render on a generous canvas and return (ink box, ink width, origin used)."""
+    r = R.render_text(text, file, size, axes or None, tracking)
+    return M.ink_box(r.mask), r.origin
+
+
+def _place(text: str, file: str, size: float, axes: dict, tracking: float, ref_box: tuple) -> tuple:
+    """Origin that puts the candidate's ink box top-left on the reference's."""
+    box, origin = _probe(text, file, size, axes, tracking)
+    if box is None:
+        return None, None
+    return (origin[0] + ref_box[1] - box[1], origin[1] + ref_box[0] - box[0]), box
+
+
+def coarse_one(job: tuple) -> dict:
+    """Start parameters and score of one font file against the reference (see module docstring, stage 1)."""
+    file, text, ref, ref_stem_px, cfg = job
+    rec = feature_records().get(file, {})
+    out = {"file": file, "family": rec.get("family")}
+    try:
+        if F.has_glyphs(file, text):
+            out["error"] = "missing glyphs"
+            return out
+        ref_box = M.ink_box(ref)
+        h_ref = ref_box[2] - ref_box[0] + 1
+        w_ref = ref_box[3] - ref_box[1] + 1
+        axes = F.regular_axes(file)
+        probe = cfg["probe_size_px"]
+        size = probe
+        for _ in range(cfg["coarse_iters"]):
+            box, _o = _probe(text, file, size, axes)
+            size = size * h_ref / max(box[2] - box[0] + 1, 1)
+            if "wght" in axes and ref_stem_px and rec.get("stem_curve"):
+                w = _interp_wght(rec["stem_curve"], ref_stem_px / size)
+                if w is not None:
+                    axes = F.regular_axes(file, w)
+        n = len(R.shape_text(text, file, size, axes or None).glyphs)
+
+        def evaluate(ax, sz):
+            """Size refit on the ink height, tracking from the ink width, origin from the ink box, score."""
+            box, _o = _probe(text, file, sz, ax)
+            sz = sz * h_ref / max(box[2] - box[0] + 1, 1)
+            box, _o = _probe(text, file, sz, ax)
+            tr = ((w_ref - (box[3] - box[1] + 1)) / max(n - 1, 1)) / sz
+            origin, _b = _place(text, file, sz, ax, tr, ref_box)
+            q = {"file": file, "size": sz, "axes": dict(ax), "tracking_em": tr, "origin": origin, "deltas": None}
+            return score(ref, render_fit(text, q, (ref.shape[1], ref.shape[0])), cfg["w_edge"]), q
+
+        s, p = evaluate(axes, size)
+        # Width and optical size cannot be read from a stem: a coarse grid per axis (measured: Open Sans at wdth
+        # 87 ranked nowhere when tried at wdth 100 only, tracking having absorbed the narrower glyphs).
+        ranges = {a["tag"]: a for a in R.font_axes(file)}
+        for tag in cfg["coarse_grid_axes"]:
+            if tag not in ranges:
+                continue
+            lo, hi = ranges[tag]["min"], ranges[tag]["max"]
+            for v in np.linspace(lo, hi, cfg["coarse_grid_n"]):
+                s2, p2 = evaluate({**p["axes"], tag: float(v)}, p["size"])
+                if s2["loss"] < s["loss"]:
+                    s, p = s2, p2
+        out.update({"params": p, **s})
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+# ---------------------------------------------------------------- fine stage (12 October 2026)
+
+def _axis_ranges(file: str) -> dict:
+    return {a["tag"]: a for a in R.font_axes(file)}
+
+
+def _blur(mask: np.ndarray, sigma: float) -> np.ndarray:
+    import cv2
+    if sigma <= 0:
+        return mask
+    return cv2.GaussianBlur(mask, (0, 0), sigma, borderType=cv2.BORDER_CONSTANT)
+
+
+def _soft(a: np.ndarray, b: np.ndarray) -> float:
+    hi = float(np.maximum(a, b).sum())
+    return float(np.minimum(a, b).sum()) / hi if hi > 0 else 1.0
+
+
+def fine_one(job: tuple) -> dict:
+    """Coarse-to-fine fit of one font file (stage 2). Globals (size, sub-pixel origin, tracking, axes) are fitted
+    by Nelder-Mead on Gaussian-blurred masks, sigma in vector.fit.sigmas (wide blur first, so the landscape is
+    smooth); then alt_rounds rounds of: size and origin y by least squares on the row profile, one x shift per
+    glyph by least squares on the image (folded into origin x, tracking and zero-mean deltas), a bounded search
+    of each axis, and the shifts again at every sigma of vector.fit.lsq_sigmas. Measured on Montserrat (truth
+    83.4 px, wght 537, one delta of 1.3 px): coordinate and joint searches stalled at IoU 0.97 to 0.98 in a
+    size against spacing valley; this decoupled order reaches IoU 0.9991, size 83.42, wght 536.7. 12 October 2026."""
+    from scipy.optimize import minimize
+    start, text, ref, cfg, fit_deltas = job
+    p0 = dict(start["params"])
+    file = p0["file"]
+    canvas = (ref.shape[1], ref.shape[0])
+    ranges = _axis_ranges(file)
+    axes0 = dict(p0.get("axes") or {})
+    for tag in cfg["fit_axes"]:
+        if tag in ranges and tag not in axes0:
+            axes0[tag] = ranges[tag]["default"]
+    tags = [t for t in cfg["fit_axes"] if t in ranges]
+    state = {"x0": np.array([p0["size"], p0["origin"][0], p0["origin"][1], p0["tracking_em"]]
+                            + [axes0[t] for t in tags], float),
+             # Deltas are held in em so a size change scales the whole line about its origin instead of fighting
+             # pixel deltas fitted at another size (measured: size stuck 0.45 % off with pixel deltas). 12 October 2026.
+             "deltas": [d / p0["size"] for d in (p0.get("deltas") or [])], "n": 0}
+    steps = np.array([p0["size"] * cfg["step_size_rel"], cfg["step_origin_px"], cfg["step_origin_px"],
+                      cfg["step_tracking_em"]] + [((ranges[t]["max"] - ranges[t]["min"]) * cfg["step_axis_rel"]) or 1.0
+                                                  for t in tags], float)
+    blurred = {sg: _blur(ref, sg) for sg in cfg["sigmas"]}
+
+    def unpack(u):
+        x = state["x0"] + u * steps
+        ax = dict(axes0)
+        for t, v in zip(tags, x[4:]):
+            ax[t] = float(min(ranges[t]["max"], max(ranges[t]["min"], v)))
+        size = float(max(1.0, x[0]))
+        return {"file": file, "size": size, "origin": (float(x[1]), float(x[2])),
+                "tracking_em": float(x[3]), "axes": ax, "deltas": [d * size for d in state["deltas"]] or None}
+
+    def loss_p(p, sigma):
+        state["n"] += 1
+        m = render_fit(text, p, canvas)
+        if sigma > 0:
+            return 1.0 - _soft(blurred[sigma], _blur(m, sigma))
+        return score(ref, m, cfg["w_edge"])["loss"]
+
+    def nm(sigma, maxfev):
+        u0 = np.zeros(len(steps))
+        sim = np.vstack([u0] + [u0 + np.eye(len(u0))[i] for i in range(len(u0))])
+        r = minimize(lambda u: loss_p(unpack(u), sigma), u0, method="Nelder-Mead",
+                     options={"initial_simplex": sim, "maxfev": maxfev, "xatol": cfg["nm_xatol"], "fatol": 1e-8})
+        state["x0"] = state["x0"] + r.x * steps
+
+    def n_glyphs():
+        p = unpack(np.zeros(len(steps)))
+        return len(R.shape_text(text, file, p["size"], p["axes"] or None).glyphs)
+
+    def lsq(sigma, max_nfev, with_deltas, idx=(0, 1, 2, 3), profile=False):
+        """Joint least squares on the blurred pixel residual (scipy trf) over the smooth parameters only: size,
+        sub-pixel origin, tracking and, when with_deltas, the per-glyph deltas in em, held at zero mean so that
+        tracking carries the common part (a uniform delta and the tracking are the same move, measured as a
+        degenerate valley). Axes are left to axis_search: HarfBuzz and every real renderer round advances to
+        whole font units along wght or wdth, so the residual steps along an axis and a Jacobian would lie.
+        idx picks the globals (0 size, 1 origin x, 2 origin y, 3 tracking). profile=True fits the row profile
+        (ink summed along each row) instead of the image: it does not move with origin x, tracking or deltas, so
+        size and origin y are fitted alone first (measured: fitted jointly, size settled 0.7 % high with every
+        delta pulled negative to undo the spreading)."""
+        from scipy.optimize import least_squares
+        idx = list(idx)
+        ng = len(idx)
+        nd = len(state["deltas"]) - 1 if with_deltas else 0
+        unit = cfg["lsq_delta_unit_em"]
+        d0 = np.array(state["deltas"][:nd], float)
+        if nd:
+            state["x0"][3] += float(d0.mean())
+            d0 = d0 - d0.mean()
+        tgt = blurred.setdefault(sigma, _blur(ref, sigma))
+        tgt = tgt.sum(axis=1) if profile else tgt.ravel()
+        lam = cfg["lsq_delta_ridge"] * math.sqrt(tgt.size)
+
+        def apply(v):
+            if nd:
+                dd = v[ng:] * unit
+                state["deltas"][:nd] = list(dd - dd.mean())
+            u = np.zeros(len(steps))
+            u[idx] = v[:ng]
+            return u
+
+        def resid(v):
+            u = apply(v)
+            state["n"] += 1
+            m = _blur(render_fit(text, unpack(u), canvas), sigma)
+            m = m.sum(axis=1) if profile else m.ravel()
+            return np.concatenate([m - tgt, lam * np.asarray(state["deltas"][:nd], float)])
+
+        # Central differences with steps that move edges by about a quarter pixel: Skia coverage is 8-bit, so a
+        # step of a few hundredths of a pixel measures quantisation noise, not the slope (measured: trf stopped on
+        # xtol at size 83.66 for a truth of 83.4 with 0.008 px steps; with these steps it lands at 83.399).
+        hs = np.array([cfg["lsq_h"]] * ng + [cfg["lsq_h_delta_em"] / unit] * nd)
+
+        def jac(v):
+            J = None
+            for i in range(v.size):
+                w1, w0 = v.copy(), v.copy()
+                w1[i] += hs[i]
+                w0[i] -= hs[i]
+                col = (resid(w1) - resid(w0)) / (2 * hs[i])
+                if J is None:
+                    J = np.empty((col.size, v.size), np.float64)
+                J[:, i] = col
+            resid(v)
+            return J
+
+        v0 = np.concatenate([np.zeros(ng), d0 / unit])
+        cost0 = float(0.5 * (resid(v0) ** 2).sum())
+        r = least_squares(resid, v0, jac=jac, method="trf", max_nfev=max_nfev, x_scale=cfg["lsq_x_scale"],
+                          xtol=cfg["lsq_tol"], ftol=cfg["lsq_tol"], gtol=cfg["lsq_tol"])
+        u = apply(r.x)
+        state["x0"] = state["x0"] + u * steps
+        state.setdefault("lsq", []).append({"sigma": sigma, "idx": idx, "deltas": nd, "profile": profile,
+                                            "status": int(r.status), "nfev": int(r.nfev),
+                                            "cost0": round(cost0, 4), "cost": round(float(r.cost), 4)})
+
+    def shifts_fit(sigma, max_nfev):
+        """Horizontal fit with size, origin y and axes held: one free x shift per glyph, solved by least squares on
+        the blurred image. Each shift only moves its own glyph, so the Jacobian is local and well conditioned,
+        unlike the cumulative chain origin + tracking + deltas (measured: the chain settled in a valley at IoU
+        0.97). The shifts are then folded back: origin x takes the first, every delta takes the difference of
+        consecutive shifts, and tracking takes their mean so the stored deltas stay at zero mean."""
+        from scipy.optimize import least_squares
+        p = unpack(np.zeros(len(steps)))
+        n = len(state["deltas"])
+        base_d = [d * p["size"] for d in state["deltas"]]
+        tgt = blurred.setdefault(sigma, _blur(ref, sigma)).ravel()
+        ox0 = p["origin"][0]
+
+        def fold(sv):
+            d = [base_d[i] + (sv[i + 1] - sv[i] if i + 1 < n else 0.0) for i in range(n)]
+            return d, ox0 + sv[0]
+
+        def resid(sv):
+            d, ox = fold(sv)
+            state["n"] += 1
+            q = dict(p, deltas=d, origin=(ox, p["origin"][1]))
+            return _blur(render_fit(text, q, canvas), sigma).ravel() - tgt
+
+        h = cfg["shift_h_px"]
+
+        def jac(sv):
+            cols = []
+            for i in range(n):
+                w1, w0 = sv.copy(), sv.copy()
+                w1[i] += h
+                w0[i] -= h
+                cols.append((resid(w1) - resid(w0)) / (2 * h))
+            return np.stack(cols, axis=1)
+
+        sv0 = np.zeros(n)
+        cost0 = float(0.5 * (resid(sv0) ** 2).sum())
+        # Bounded shifts: on a wrong family an unbounded shift ran to 26 px and made the fit worse than the
+        # coarse start; a glyph of the right family never needs more than shift_bound_em. 12 October 2026.
+        bound = cfg["shift_bound_em"] * p["size"]
+        r = least_squares(resid, sv0, jac=jac, method="trf", max_nfev=max_nfev, x_scale=1.0, bounds=(-bound, bound),
+                          xtol=cfg["lsq_tol"], ftol=cfg["lsq_tol"], gtol=cfg["lsq_tol"])
+        if r.cost > cost0:
+            return
+        d, ox = fold(r.x)
+        if not fit_deltas:
+            # Without per-glyph deltas the shifts still fit origin x and tracking (their least-squares line).
+            k = np.arange(n, dtype=float)
+            slope, icpt = np.polyfit(k, r.x, 1) if n > 1 else (0.0, r.x[0])
+            d, ox = list(base_d), ox0 + icpt
+            state["x0"][3] += slope / p["size"]
+        else:
+            dd = np.array(d[:-1], float)
+            mean = float(dd.mean()) if dd.size else 0.0
+            state["x0"][3] += mean / p["size"]
+            d = list(dd - mean) + [0.0]
+        state["x0"][1] += ox - ox0
+        state["deltas"] = [v / p["size"] for v in d]
+        state.setdefault("lsq", []).append({"sigma": sigma, "kind": "glyph shifts", "status": int(r.status),
+                                            "nfev": int(r.nfev), "cost0": round(cost0, 4), "cost": round(float(r.cost), 4)})
+
+    def axis_search(sigma, frac):
+        """Axes on the blurred pixel cost: one axis by a bounded 1-D search within +-frac of its range; two or
+        more jointly by Nelder-Mead (simplex edge frac of each range), because wght and opsz both move the
+        hairlines and a coordinate search stops in their shared valley (measured on Source Serif 4: wght 442 and
+        opsz 33.8 for a truth of 420 and 30, IoU 0.967)."""
+        from scipy.optimize import minimize, minimize_scalar
+        tgt = blurred.setdefault(sigma, _blur(ref, sigma))
+        if len(tags) >= 2:
+            idx = [4 + k for k in range(len(tags))]
+            lo = np.array([ranges[t]["min"] for t in tags])
+            hi = np.array([ranges[t]["max"] for t in tags])
+            a0 = np.clip(state["x0"][idx], lo, hi)
+            sc_ = (hi - lo) * frac
+
+            def c(u):
+                state["x0"][idx] = np.clip(a0 + u * sc_, lo, hi)
+                state["n"] += 1
+                return float(((_blur(render_fit(text, unpack(np.zeros(len(steps))), canvas), sigma) - tgt) ** 2).sum())
+            u0 = np.zeros(len(tags))
+            base = c(u0)
+            sim = np.vstack([u0] + [np.eye(len(tags))[i] for i in range(len(tags))])
+            r = minimize(c, u0, method="Nelder-Mead",
+                         options={"initial_simplex": sim, "maxfev": cfg["axis_nm_evals"] * len(tags),
+                                  "xatol": 1e-3, "fatol": 1e-6})
+            state["x0"][idx] = np.clip(a0 + (r.x if r.fun < base else u0) * sc_, lo, hi)
+            return
+        for k, t in enumerate(tags):
+            i = 4 + k
+            lo, hi = ranges[t]["min"], ranges[t]["max"]
+            # Nelder-Mead moves x0 freely and unpack clamps; bring the axis back into its range first.
+            cur = float(min(hi, max(lo, state["x0"][i])))
+            state["x0"][i] = cur
+
+            def c(v):
+                state["x0"][i] = v
+                state["n"] += 1
+                return float(((_blur(render_fit(text, unpack(np.zeros(len(steps))), canvas), sigma) - tgt) ** 2).sum())
+            base = c(cur)
+            span = (hi - lo) * frac
+            r = minimize_scalar(c, bounds=(max(lo, cur - span), min(hi, cur + span)), method="bounded",
+                                options={"xatol": cfg["axis_xatol"], "maxiter": cfg["axis_iters"]})
+            state["x0"][i] = float(r.x) if r.fun < base else cur
+
+    trace = []
+
+    best = {}
+
+    def mark(stage):
+        """Score the current state and keep the best one seen (porte locale of zenray-height: a stage that makes
+        the fit worse is never kept; measured on a modified Montserrat, the rounds drifted from IoU 0.80 to 0.51
+        on a start they could not explain)."""
+        sc = score(ref, render_fit(text, unpack(np.zeros(len(steps))), canvas), cfg["w_edge"])
+        trace.append({"stage": stage, **sc})
+        if not best or sc["loss"] < best["loss"]:
+            best.update({"loss": sc["loss"], "x0": state["x0"].copy(), "deltas": list(state["deltas"]), "stage": stage})
+
+    mark("start")
+
+    for sg in cfg["sigmas"]:
+        nm(sg, cfg["nm_max_evals"])
+    mark("globals")
+    if len(state["deltas"]) != n_glyphs():
+        state["deltas"] = [0.0] * n_glyphs()
+    frac = cfg["axis_frac"]
+    for rnd in range(cfg["alt_rounds"]):
+        # Order matters (measured): an axis searched before the glyphs are placed absorbs the spacing error
+        # (wght ran to 565 for a truth of 537), so each round places the glyphs, then searches the axes.
+        lsq(cfg["lsq_sigmas"][0], cfg["lsq_max_nfev"], False, idx=(0, 2), profile=True)
+        shifts_fit(cfg["lsq_sigmas"][0], cfg["lsq_max_nfev"])
+        if tags:
+            # 12 October 2026: the axis sigma per round comes from vector.fit.axis_sigmas (last value repeats); a
+            # wide blur hides the hairlines that separate wght from opsz, so later rounds search on a sharper image.
+            asg = cfg.get("axis_sigmas") or [cfg["lsq_sigmas"][0]]
+            axis_search(asg[min(rnd, len(asg) - 1)], frac)
+            frac *= cfg.get("axis_frac_decay", 0.5)
+        for sg in cfg["lsq_sigmas"]:
+            shifts_fit(sg, cfg["lsq_max_nfev"])
+        mark(f"round {rnd + 1}")
+    state["x0"], state["deltas"] = best["x0"], best["deltas"]
+    p = unpack(np.zeros(len(steps)))
+    s = score(ref, render_fit(text, p, canvas), cfg["w_edge"])
+    p["deltas"] = [round(float(d), 4) for d in p["deltas"]] if p.get("deltas") else None
+    p["origin"] = [round(float(v), 4) for v in p["origin"]]
+    p["axes"] = {k: round(float(v), 4) for k, v in p["axes"].items()}
+    p["size"], p["tracking_em"] = round(float(p["size"]), 5), round(float(p["tracking_em"]), 6)
+    return {"file": file, "family": start.get("family"), "params": p, **s, "match": is_match(s, cfg),
+            "evals": state["n"], "trace": trace, "kept": best["stage"], "lsq": state.get("lsq"),
+            "coarse_loss": start.get("loss")}
+
+
+# ---------------------------------------------------------------- profiled axis polish (12 October 2026)
+
+def _refit_at_axes(job: tuple) -> dict:
+    """Refit placement (size, origin, tracking, deltas) with the axes held at one location; the profiled loss of
+    that location. 12 October 2026."""
+    fit, axes, text, ref, cfg, rounds = job
+    p = dict(fit["params"], axes=dict(axes))
+    fc = {**cfg, "fit_axes": [], "sigmas": [], "alt_rounds": rounds}
+    r = fine_one(({"params": p, "family": fit.get("family"), "loss": fit.get("coarse_loss")}, text, ref, fc, True))
+    r["params"]["axes"] = {k: round(float(v), 4) for k, v in axes.items()}
+    return r
+
+
+def _quad_min(pts: np.ndarray, z: np.ndarray, lo: np.ndarray, hi: np.ndarray):
+    """Minimum of a full quadratic fitted to (pts, z) when it is positive definite, clipped to [lo, hi]."""
+    n = pts.shape[1]
+    cols = [np.ones(len(pts))] + [pts[:, i] for i in range(n)]
+    pairs = [(i, j) for i in range(n) for j in range(i, n)]
+    cols += [pts[:, i] * pts[:, j] for i, j in pairs]
+    A = np.stack(cols, axis=1)
+    if len(pts) < A.shape[1]:
+        return None
+    c, *_ = np.linalg.lstsq(A, z, rcond=None)
+    b = c[1:1 + n]
+    H = np.zeros((n, n))
+    for k, (i, j) in enumerate(pairs):
+        v = c[1 + n + k]
+        if i == j:
+            H[i, i] = 2 * v
+        else:
+            H[i, j] = H[j, i] = v
+    if np.any(np.linalg.eigvalsh(H) <= 0):
+        return None
+    return np.clip(np.linalg.solve(H, -b), lo, hi)
+
+
+def polish_axes(fit: dict, text: str, ref: np.ndarray, cfg: dict, workers: int) -> dict:
+    """Profiled axis polish of one fine fit (12 October 2026). The fine stage searches the axes with size and
+    placement held, which stops in a valley where a heavier wght, a larger opsz and a larger size draw nearly the
+    same hairlines (measured on Source Serif 4, truth wght 420 opsz 30: fine stopped at 431.8 / 33.1, IoU 0.9756,
+    while the placement refitted at the truth axes gives 0.9997). Here every candidate axis location gets its own
+    placement refit, so the loss compared is the profiled one, which is smooth and has its minimum at the truth.
+    A grid of polish.grid_n values per axis (span polish.span_frac of each range) is evaluated in parallel, the
+    centre of the next level is the minimum of a quadratic fitted to the grid when it is positive definite (else
+    the best grid point), the span shrinks by polish.shrink; the best location is refitted with polish.final_rounds.
+    Returns the better of the input fit and the polished one."""
+    pc = cfg.get("polish") or {}
+    tags = [t for t in cfg["fit_axes"] if t in (fit["params"].get("axes") or {})]
+    if not tags or pc.get("levels", 0) <= 0:
+        return fit
+    rng = _axis_ranges(fit["file"])
+    tags = [t for t in tags if t in rng and rng[t]["max"] > rng[t]["min"]]
+    if not tags:
+        return fit
+    lo = np.array([rng[t]["min"] for t in tags], float)
+    hi = np.array([rng[t]["max"] for t in tags], float)
+    centre = np.array([fit["params"]["axes"][t] for t in tags], float)
+    span = (hi - lo) * pc["span_frac"]
+    seen = {}
+    log = []
+
+    def run(points):
+        todo = [tuple(np.round(p, 3)) for p in points]
+        todo = [p for p in dict.fromkeys(todo) if p not in seen]
+        jobs = [(fit, dict(zip(tags, p)), text, ref, cfg, pc["rounds"]) for p in todo]
+        with ProcessPoolExecutor(workers) as pool:
+            for p, r in zip(todo, pool.map(_refit_at_axes, jobs)):
+                seen[p] = r
+
+    for level in range(pc["levels"]):
+        axes_vals = [np.clip(np.linspace(c - s, c + s, pc["grid_n"]), l, h) for c, s, l, h in zip(centre, span, lo, hi)]
+        grid = np.stack(np.meshgrid(*axes_vals, indexing="ij"), axis=-1).reshape(-1, len(tags))
+        run(list(grid) + [centre])
+        pts = np.array([p for p in seen if all(abs(p[i] - centre[i]) <= span[i] + 1e-6 for i in range(len(tags)))], float)
+        z = np.array([seen[tuple(p)]["loss"] for p in pts])
+        best_p = np.array(min(seen, key=lambda k: seen[k]["loss"]), float)
+        q = _quad_min(pts / np.maximum(span, 1e-9), z, lo / np.maximum(span, 1e-9), hi / np.maximum(span, 1e-9))
+        if q is not None:
+            q = q * span
+            run([q])
+            if seen[tuple(np.round(q, 3))]["loss"] < seen[tuple(best_p)]["loss"]:
+                best_p = np.round(q, 3)
+        log.append({"level": level, "centre": dict(zip(tags, map(float, centre))), "span": list(map(float, span)),
+                    "evaluated": len(seen), "best": dict(zip(tags, map(float, best_p))),
+                    "best_loss": round(float(seen[tuple(np.round(best_p, 3))]["loss"]), 6), "quadratic": q is not None})
+        centre = best_p
+        span = span / pc["shrink"]
+    final = _refit_at_axes((fit, dict(zip(tags, centre)), text, ref, cfg, pc["final_rounds"]))
+    final["family"] = fit.get("family")
+    final["polish"] = log
+    final["trace"] = list(fit.get("trace") or []) + [{"stage": "polish", **{k: final[k] for k in ("iou", "edge_mean", "edge_p95", "loss")}}]
+    return final if final["loss"] < fit["loss"] else dict(fit, polish=log)
+
+
+# ---------------------------------------------------------------- entry point (12 October 2026)
+
+def match_font(ref: np.ndarray, text: str, files: list[str] | None = None, exclude_families: list[str] | None = None,
+               top_k: int | None = None, fit_deltas: bool = True, workers: int | None = None,
+               overrides: dict | None = None) -> dict:
+    """Rank the dataset's font files against a reference mask of a known string and fit the best ones.
+    files restricts the candidates (default: every usable file of features.jsonl); exclude_families removes
+    families (used by the verifier to simulate a font absent from the dataset). Returns coarse ranking, fine fits
+    sorted by loss, the best fit and whether it reaches the match rule (vector.fit.match)."""
+    cfg = {**_cfg(), **(overrides or {})}
+    top_k = top_k or cfg["top_k"]
+    workers = workers or cfg["workers"]
+    ref = np.asarray(ref, np.float32)
+    recs = feature_records()
+    pool_files = files or [f for f, r in recs.items() if r.get("usable")]
+    excl = set(exclude_families or [])
+    pool_files = [f for f in pool_files if recs.get(f, {}).get("family") not in excl]
+    st = M.stroke_widths(ref)
+    ref_stem = st.get("p50") if st else None
+    jobs = [(f, text, ref, ref_stem, cfg) for f in sorted(pool_files)]
+    with ProcessPoolExecutor(workers) as pool:
+        coarse = list(pool.map(coarse_one, jobs, chunksize=max(1, len(jobs) // (workers * 4))))
+        ok = sorted([c for c in coarse if "loss" in c], key=lambda c: c["loss"])
+        fine = list(pool.map(fine_one, [(c, text, ref, cfg, fit_deltas) for c in ok[:top_k]]))
+    fine.sort(key=lambda r: r["loss"])
+    # 12 October 2026: the polish_top best fits get the profiled axis polish (see polish_axes), sequentially, each
+    # with its own pool of workers.
+    for i in range(min(len(fine), (cfg.get("polish") or {}).get("top", 0))):
+        if not fine[i]["match"] or (cfg.get("polish") or {}).get("always", True):
+            fine[i] = polish_axes(fine[i], text, ref, cfg, workers)
+    fine.sort(key=lambda r: r["loss"])
+    best = fine[0] if fine else None
+    return {"text": text, "canvas": [ref.shape[1], ref.shape[0]], "candidates": len(jobs),
+            "coarse_errors": sum(1 for c in coarse if "error" in c),
+            "coarse": [{k: c.get(k) for k in ("family", "file", "loss", "iou", "edge_mean")} for c in ok[:cfg["report_coarse"]]],
+            "fits": fine, "best": best, "match": bool(best and best["match"])}

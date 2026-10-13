@@ -1,0 +1,399 @@
+# 12 October 2026, 16:00 CEST: deterministic vector rasteriser for the F0 harness.
+# Text is shaped by HarfBuzz (uharfbuzz, Apache-2.0: kerning, ligatures and variable axes in one call), its
+# outlines are drawn by HarfBuzz into an SVG path in pixel units (y down), and the path is filled by Skia
+# (skia-python, BSD-3) with analytic anti-aliasing on a CPU raster surface, which is bit-for-bit repeatable.
+# SVG documents are rendered by resvg (resvg-py, MIT) so a file exported by export_text_svg can be re-read
+# by an independent renderer. Versions are pinned in requirements-vector.txt and recorded by versions().
+# Every default comes from settings.json, section "vector" (HDA law).
+from __future__ import annotations
+
+import hashlib
+import io
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+
+import numpy as np
+
+from zrmd import settings
+
+
+def _cfg() -> dict:
+    return settings.get("vector.render")
+
+
+def versions() -> dict:
+    """Library versions that produced a raster (written into every report so a change is visible)."""
+    import resvg_py
+    import skia
+    import uharfbuzz
+    from importlib.metadata import version
+    return {"skia-python": skia.__version__, "uharfbuzz": uharfbuzz.__version__,
+            "resvg-py": version("resvg-py"), "numpy": np.__version__}
+
+
+# ---------------------------------------------------------------- shaping and outlines (12 October 2026)
+
+@lru_cache(maxsize=64)
+def _face(font_file: str):
+    import uharfbuzz as hb
+    blob = hb.Blob.from_file_path(font_file)
+    return hb.Face(blob)
+
+
+def font_axes(font_file: str) -> list[dict]:
+    """Variable axes of a font file: tag, min, default, max (empty for a static font)."""
+    face = _face(str(font_file))
+    return [{"tag": a.tag, "min": a.min_value, "default": a.default_value, "max": a.max_value}
+            for a in face.axis_infos]
+
+
+def _clamped_axes(font_file: str, axes: dict | None) -> dict:
+    """Clamp requested axis values to the font's ranges; unknown tags are an error, never ignored in silence."""
+    if not axes:
+        return {}
+    known = {a["tag"]: a for a in font_axes(font_file)}
+    out = {}
+    for tag, value in axes.items():
+        if tag not in known:
+            raise KeyError(f"font {Path(font_file).name} has no axis '{tag}' (axes: {sorted(known)})")
+        a = known[tag]
+        out[tag] = float(min(a["max"], max(a["min"], value)))
+    return out
+
+
+class _SvgPen:
+    """Collects HarfBuzz draw callbacks as an SVG path in pixel units, y down, offset by (dx, dy)."""
+
+    def __init__(self, scale: float, dx: float, dy: float, digits: int):
+        self.s, self.dx, self.dy, self.d = scale, dx, dy, digits
+        self.parts: list[str] = []
+
+    def _p(self, x, y):
+        return f"{round(self.dx + x * self.s, self.d):g} {round(self.dy - y * self.s, self.d):g}"
+
+    def moveTo(self, p):
+        self.parts.append("M" + self._p(*p))
+
+    def lineTo(self, p):
+        self.parts.append("L" + self._p(*p))
+
+    def qCurveTo(self, *pts):
+        # HarfBuzz emits one off-curve point and one on-curve point per call.
+        self.parts.append("Q" + " ".join(self._p(*p) for p in pts))
+
+    def curveTo(self, *pts):
+        self.parts.append("C" + " ".join(self._p(*p) for p in pts))
+
+    def closePath(self):
+        self.parts.append("Z")
+
+    def endPath(self):
+        pass
+
+
+@dataclass
+class TextOutline:
+    """Shaped text as vector outlines in pixels: one path per glyph, plus the shaping data that produced them."""
+    text: str
+    font_file: str
+    size_px: float
+    axes: dict
+    tracking_em: float
+    glyphs: list[dict] = field(default_factory=list)   # name, cluster, x, advance, kern, path
+    advance_px: float = 0.0
+    ascender_px: float = 0.0
+    descender_px: float = 0.0
+    x_height_px: float = 0.0
+    cap_height_px: float = 0.0
+
+    def path_d(self) -> str:
+        return " ".join(g["path"] for g in self.glyphs if g["path"])
+
+
+def shape_text(text: str, font_file: str, size_px: float, axes: dict | None = None, tracking_em: float = 0.0,
+               kerning: bool = True, advance_deltas: list | None = None) -> TextOutline:
+    """Shape text with HarfBuzz and return per-glyph outlines with the baseline at y = ascender (pixels, y down).
+    kerning=False disables the 'kern' feature, so the difference with kerning=True is the font's own kerning.
+    advance_deltas (F1, 12 October 2026): optional per-glyph extra advance in pixels, added after that glyph, so a
+    fitted per-glyph spacing is a layout parameter and never an edit of the font."""
+    import uharfbuzz as hb
+    cfg = _cfg()
+    font_file = str(font_file)
+    face = _face(font_file)
+    font = hb.Font(face)
+    # F1, 12 October 2026: HarfBuzz rounds positions to integer units of font.scale; at scale = upem an advance
+    # jumps by a whole font unit (measured: 0.083 px at 83 px on a 1000 upem font, as wght moves 537 -> 538), which
+    # made the fitting loss step-shaped. The font is scaled by vector.render.subunit_scale so positions keep
+    # 1/64 of a font unit; outlines were already exact.
+    sub = int(cfg.get("subunit_scale", 1))
+    upem = face.upem
+    font.scale = (upem * sub, upem * sub)
+    ax = _clamped_axes(font_file, axes)
+    if ax:
+        font.set_variations(ax)
+    scale = size_px / (upem * sub)
+
+    def run(features):
+        buf = hb.Buffer()
+        buf.add_str(text)
+        buf.guess_segment_properties()
+        hb.shape(font, buf, features)
+        return buf.glyph_infos, buf.glyph_positions
+
+    infos, positions = run({"kern": bool(kerning)})
+    _, plain = run({"kern": False})
+    ext = font.get_font_extents("ltr")
+    ascender = ext.ascender * scale
+    out = TextOutline(text, font_file, float(size_px), ax, float(tracking_em),
+                      ascender_px=ascender, descender_px=-ext.descender * scale)
+    xh = font.get_metric_position_with_fallback(hb.OTMetricsTag.X_HEIGHT)
+    ch = font.get_metric_position_with_fallback(hb.OTMetricsTag.CAP_HEIGHT)
+    out.x_height_px = float(xh * scale) if xh else 0.0
+    out.cap_height_px = float(ch * scale) if ch else 0.0
+    track = tracking_em * size_px
+    x = 0.0
+    for i, (info, pos) in enumerate(zip(infos, positions)):
+        pen = _SvgPen(scale, x + pos.x_offset * scale, ascender - pos.y_offset * scale, cfg["path_digits"])
+        font.draw_glyph_with_pen(info.codepoint, pen)
+        adv = pos.x_advance * scale
+        kern = (pos.x_advance - plain[i].x_advance) * scale if i < len(plain) else 0.0
+        out.glyphs.append({"gid": int(info.codepoint), "name": font.get_glyph_name(info.codepoint) or str(info.codepoint),
+                           "cluster": int(info.cluster), "x": round(x, 4), "advance": round(adv, 4),
+                           "kern": round(kern, 4), "path": "".join(pen.parts)})
+        extra = float(advance_deltas[i]) if advance_deltas is not None and i < len(advance_deltas) else 0.0
+        x += adv + track + extra
+    out.advance_px = x - (track if infos else 0.0)
+    return out
+
+
+# ---------------------------------------------------------------- rasterisation (12 October 2026)
+
+_PATH_TOKEN = None
+
+
+def skia_path(d: str):
+    """Build a skia.Path from the absolute SVG path dialect this module emits (M, L, Q, C, Z).
+    skia-python 144 has no SVG path parser; any other command is an error, never skipped in silence.
+    Arbitrary SVG documents go through render_svg (resvg) instead. (12 October 2026)"""
+    import re
+    import skia
+    global _PATH_TOKEN
+    if _PATH_TOKEN is None:
+        _PATH_TOKEN = re.compile(r"([A-Za-z])|(-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)")
+    path = skia.Path()
+    cmd, nums = None, []
+    arity = {"M": 2, "L": 2, "Q": 4, "C": 6, "Z": 0}
+
+    def flush():
+        if cmd is None:
+            return
+        n = arity[cmd]
+        if cmd == "Z":
+            path.close()
+            return
+        if not nums or len(nums) % n:
+            raise ValueError(f"path command {cmd} has {len(nums)} numbers, expected a multiple of {n}")
+        for k in range(0, len(nums), n):
+            v = nums[k:k + n]
+            if cmd == "M" and k == 0:
+                path.moveTo(*v)
+            elif cmd in ("M", "L"):
+                path.lineTo(*v)
+            elif cmd == "Q":
+                path.quadTo(*v)
+            else:
+                path.cubicTo(*v)
+
+    for letter, number in _PATH_TOKEN.findall(d or ""):
+        if letter:
+            flush()
+            if letter not in arity:
+                raise ValueError(f"unsupported path command '{letter}' (only absolute M L Q C Z)")
+            cmd, nums = letter, []
+        else:
+            nums.append(float(number))
+    flush()
+    return path
+
+
+def _surface(width: int, height: int):
+    import skia
+    info = skia.ImageInfo.Make(width, height, skia.ColorType.kRGBA_8888_ColorType, skia.AlphaType.kPremul_AlphaType)
+    return skia.Surface.MakeRaster(info)
+
+
+def fill_path(d: str, width: int, height: int, dx: float = 0.0, dy: float = 0.0, scale: float = 1.0,
+              colour=(255, 255, 255, 255), background=(0, 0, 0, 0), antialias: bool | None = None,
+              even_odd: bool = False) -> np.ndarray:
+    """Fill an SVG path string into an RGBA uint8 array (H, W, 4), premultiplied off (straight alpha)."""
+    import skia
+    if antialias is None:
+        antialias = _cfg()["antialias"]
+    path = skia_path(d)
+    path.setFillType(skia.PathFillType.kEvenOdd if even_odd else skia.PathFillType.kWinding)
+    surface = _surface(int(width), int(height))
+    canvas = surface.getCanvas()
+    canvas.clear(skia.Color(*background[:3], background[3]))
+    canvas.translate(dx, dy)
+    canvas.scale(scale, scale)
+    paint = skia.Paint(AntiAlias=bool(antialias), Color=skia.Color(*colour[:3], colour[3]))
+    canvas.drawPath(path, paint)
+    img = surface.makeImageSnapshot()
+    arr = np.array(img.toarray(colorType=skia.ColorType.kRGBA_8888_ColorType,
+                               alphaType=skia.AlphaType.kUnpremul_AlphaType), dtype=np.uint8)
+    return arr
+
+
+def path_bounds(d: str) -> tuple[float, float, float, float]:
+    """Tight bounds (left, top, right, bottom) of an SVG path in its own units."""
+    import skia
+    if not d:
+        return (0.0, 0.0, 0.0, 0.0)
+    r = skia_path(d).computeTightBounds()
+    return (r.left(), r.top(), r.right(), r.bottom())
+
+
+@dataclass
+class TextRaster:
+    mask: np.ndarray        # float32 0..1 coverage, (H, W)
+    rgba: np.ndarray        # uint8 (H, W, 4)
+    outline: TextOutline
+    origin: tuple            # (x, y) pixel position of the pen start on the baseline
+    sha256: str
+
+
+def render_text(text: str, font_file: str, size_px: float, axes: dict | None = None, tracking_em: float = 0.0,
+                kerning: bool = True, pad: int | None = None, canvas: tuple | None = None,
+                colour=(255, 255, 255, 255)) -> TextRaster:
+    """Shape, outline and fill a text line. The canvas is the line box (advance by ascender plus descender)
+    plus pad on every side, so two renders of the same line share the same pixel grid; canvas=(w, h) forces it."""
+    cfg = _cfg()
+    pad = cfg["pad_px"] if pad is None else pad
+    o = shape_text(text, font_file, size_px, axes, tracking_em, kerning)
+    left, top, right, bottom = path_bounds(o.path_d())
+    x0 = pad - min(0.0, left)
+    y0 = pad - min(0.0, top)
+    if canvas is None:
+        w = int(np.ceil(x0 + max(o.advance_px, right) + pad))
+        h = int(np.ceil(y0 + max(o.ascender_px + o.descender_px, bottom) + pad))
+    else:
+        w, h = canvas
+    rgba = fill_path(o.path_d(), w, h, dx=x0, dy=y0, colour=colour)
+    mask = rgba[..., 3].astype(np.float32) / 255.0
+    return TextRaster(mask, rgba, o, (x0, y0 + o.ascender_px), hashlib.sha256(rgba.tobytes()).hexdigest())
+
+
+def render_text_at(text: str, font_file: str, size_px: float, origin: tuple, canvas: tuple, axes: dict | None = None,
+                   tracking_em: float = 0.0, advance_deltas: list | None = None, kerning: bool = True) -> np.ndarray:
+    """Coverage mask (float32 0..1, H x W) of a line whose pen starts at origin = (x, y on the baseline), on a canvas
+    of canvas = (width, height). This is the fitting renderer of F1: the reference crop fixes the canvas, and the
+    sub-pixel origin is a fitted parameter, so nothing is re-aligned in silence. 12 October 2026."""
+    o = shape_text(text, font_file, size_px, axes, tracking_em, kerning, advance_deltas)
+    rgba = fill_path(o.path_d(), int(canvas[0]), int(canvas[1]), dx=float(origin[0]),
+                     dy=float(origin[1]) - o.ascender_px)
+    return rgba[..., 3].astype(np.float32) / 255.0
+
+
+# ---------------------------------------------------------------- SVG documents (12 October 2026)
+
+def render_svg(svg: str | Path, width: int | None = None, height: int | None = None, engine: str | None = None,
+               ss: int = 1) -> np.ndarray:
+    """Render an SVG document (markup or file path) to RGBA uint8 (H, W, 4).
+    engine 'skia' (skia.SVGDOM, same analytic coverage as fill_path, so an exported SVG lands on its raster) or
+    'resvg' (an independent renderer, used to prove the file is not tied to Skia). 12 October 2026: measured on a
+    vertical edge, resvg rounds coverage under 0.1 to 0 and above 0.9 to 1, so cross-renderer checks use the
+    looser vector.verify.cross_renderer rule.
+    ss > 1 is the reference rasteriser: the document is drawn ss times larger and box-averaged (premultiplied), so
+    the coverage approaches the exact area. 12 October 2026: measured on a cubic stroke of width 10 whose exact
+    area is 1664.18 px, skia.SVGDOM gives 1657.2 at 1x, 1662.9 at 4x and 1664.6 at 8x; the 1x under-coverage of
+    curved strokes is a renderer error that no geometry can match (IoU 0.987 between 1x and 8x of one stroke)."""
+    engine = engine or _cfg()["svg_engine"]
+    text = Path(svg).read_text(encoding="utf-8") if not str(svg).lstrip().startswith("<") else str(svg)
+    if int(ss) > 1:
+        return _render_svg_ss(text, width, height, engine, int(ss))
+    if engine == "resvg":
+        import resvg_py
+        from PIL import Image
+        kw = {"shape_rendering": _cfg()["svg_shape_rendering"], "skip_system_fonts": True}
+        if width:
+            kw["width"] = int(width)
+        if height:
+            kw["height"] = int(height)
+        png = resvg_py.svg_to_bytes(svg_string=text, **kw)
+        return np.asarray(Image.open(io.BytesIO(bytes(png))).convert("RGBA"), dtype=np.uint8)
+    if engine != "skia":
+        raise ValueError(f"unknown SVG engine '{engine}' (skia, resvg)")
+    import re
+    import skia
+    dom = skia.SVGDOM.MakeFromStream(skia.MemoryStream(text.encode("utf-8"), True))
+    if dom is None:
+        raise ValueError("skia could not parse the SVG document")
+    if not (width and height):
+        mw = re.search(r'<svg[^>]*\swidth="([\d.]+)', text)
+        mh = re.search(r'<svg[^>]*\sheight="([\d.]+)', text)
+        if not (mw and mh):
+            raise ValueError("SVG has no width and height; pass them explicitly")
+        width = width or int(round(float(mw.group(1))))
+        height = height or int(round(float(mh.group(1))))
+    surface = _surface(int(width), int(height))
+    canvas = surface.getCanvas()
+    canvas.clear(skia.Color(0, 0, 0, 0))
+    dom.setContainerSize(skia.Size(int(width), int(height)))
+    dom.render(canvas)
+    return np.array(surface.makeImageSnapshot().toarray(colorType=skia.ColorType.kRGBA_8888_ColorType,
+                                                        alphaType=skia.AlphaType.kUnpremul_AlphaType), dtype=np.uint8)
+
+
+def _render_svg_ss(text: str, width, height, engine: str, ss: int) -> np.ndarray:
+    """Supersampled render_svg (12 October 2026): the root width, height and viewBox are rewritten to ss times the
+    size, rendered, then box-averaged in premultiplied alpha and unpremultiplied back to RGBA uint8."""
+    import re
+    if not (width and height):
+        mw = re.search(r"<svg[^>]*\swidth=[\"']([\d.]+)", text)
+        mh = re.search(r"<svg[^>]*\sheight=[\"']([\d.]+)", text)
+        if not (mw and mh):
+            raise ValueError("SVG has no width and height; pass them explicitly")
+        width = width or int(round(float(mw.group(1))))
+        height = height or int(round(float(mh.group(1))))
+    w, h = int(width), int(height)
+    head = re.search(r"<svg\b[^>]*>", text)
+    if head is None:
+        raise ValueError("no <svg> root element")
+    tag = head.group(0)
+    if not re.search(r"\sviewBox=", tag):
+        tag = tag[:-1] + f' viewBox="0 0 {w} {h}">'
+    tag = re.sub(r"(\swidth=)([\"'])[^\"']*\2", lambda m: f"{m.group(1)}{m.group(2)}{w * ss}{m.group(2)}", tag, count=1)
+    tag = re.sub(r"(\sheight=)([\"'])[^\"']*\2", lambda m: f"{m.group(1)}{m.group(2)}{h * ss}{m.group(2)}", tag, count=1)
+    big = render_svg(text[:head.start()] + tag + text[head.end():], w * ss, h * ss, engine).astype(np.float64)
+    a = big[..., 3:4] / 255.0
+    pre = np.concatenate([big[..., :3] * a, a], -1).reshape(h, ss, w, ss, 4).mean(axis=(1, 3))
+    alpha = pre[..., 3:4]
+    rgb = np.where(alpha > 0, pre[..., :3] / np.maximum(alpha, 1e-12), 0.0)
+    return np.clip(np.round(np.concatenate([rgb, alpha * 255.0], -1)), 0, 255).astype(np.uint8)
+
+
+def svg_mask(svg: str | Path, width: int | None = None, height: int | None = None, engine: str | None = None,
+             ss: int = 1) -> np.ndarray:
+    """Alpha coverage 0..1 of an SVG document (ss > 1: reference rasteriser, see render_svg)."""
+    return render_svg(svg, width, height, engine, ss)[..., 3].astype(np.float32) / 255.0
+
+
+def export_text_svg(raster: TextRaster, params: dict | None = None, fill: str = "#ffffff") -> str:
+    """Editable SVG of a rendered line: one <g id="line"> with one named <path> per glyph, the parameters that
+    produced it in a <metadata> JSON block, and the same canvas as the raster (so svg_mask reproduces it)."""
+    import json
+    o = raster.outline
+    h, w = raster.mask.shape
+    x0, y0 = raster.origin[0], raster.origin[1] - o.ascender_px
+    meta = {"schema": "zrmd/vector-text@1", "date": "12 October 2026", "text": o.text, "font_file": o.font_file,
+            "size_px": o.size_px, "axes": o.axes, "tracking_em": o.tracking_em, **(params or {})}
+    rows = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
+            f"<metadata>{json.dumps(meta, ensure_ascii=False)}</metadata>",
+            f'<g id="line" fill="{fill}" transform="translate({x0:g} {y0:g})">']
+    for i, g in enumerate(o.glyphs):
+        if g["path"]:
+            gid = f"g{i:03d}-{g['name']}".replace('"', "")
+            rows.append(f'<path id="{gid}" data-advance="{g["advance"]}" data-kern="{g["kern"]}" d="{g["path"]}"/>')
+    rows += ["</g>", "</svg>"]
+    return "\n".join(rows)

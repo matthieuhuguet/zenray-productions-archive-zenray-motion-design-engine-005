@@ -1,0 +1,87 @@
+# 12 October 2026, 14:10 CEST: "arch glow" wallpaper as a procedural field, fitted per frame to the reference.
+# The same formula runs in numpy (fit) and in GLSL (templates/device3d/archglow.glsl), so the render is sharp at
+# any resolution and every look is a parameter, never a pixel of the reference.
+# Screen coordinates: u in [-1, 1] left to right, v in [0, 1] top to bottom (aspect-corrected by `aspect`).
+# Field: arch curve va(u) = apex + k * |u|^p. Signed distance d = (v - va) (positive inside the dark arch).
+# Inside: black with a soft edge. Outside: ramp from the edge colour (rim) through the core (white) to the
+# outer colour, then to the top colour; rim and core colours blend toward their "side" variants with |u|.
+# Plus a centre dot (dark disc with a light ring) above the apex.
+from __future__ import annotations
+
+import numpy as np
+from scipy.optimize import least_squares
+
+NAMES = ["apex", "k", "p", "soft", "w_rim", "w_core", "w_out", "dot_y", "dot_r"]
+COLOURS = ["c_rim", "c_rim_side", "c_core", "c_core_side", "c_out", "c_top"]
+
+
+def smooth(e0, e1, x):
+    t = np.clip((x - e0) / (e1 - e0 + 1e-9), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def field(P: dict, u: np.ndarray, v: np.ndarray, aspect: float) -> np.ndarray:
+    au = np.abs(u)
+    va = P["apex"] + P["k"] * au ** P["p"]
+    d = v - va
+    side = smooth(0.15, 0.95, au)[..., None]
+    rim = np.array(P["c_rim"]) * (1 - side) + np.array(P["c_rim_side"]) * side
+    core = np.array(P["c_core"]) * (1 - side) + np.array(P["c_core_side"]) * side
+    out, top = np.array(P["c_out"]), np.array(P["c_top"])
+    o = -d  # distance above the curve
+    a1 = smooth(0, P["w_rim"], o)[..., None]
+    a2 = smooth(P["w_rim"], P["w_rim"] + P["w_core"], o)[..., None]
+    a3 = smooth(P["w_rim"] + P["w_core"], P["w_rim"] + P["w_core"] + P["w_out"], o)[..., None]
+    col = rim * (1 - a1) + core * a1
+    col = col * (1 - a2) + out * a2
+    col = col * (1 - a3) + top * a3
+    inside = smooth(-P["soft"], P["soft"], d)[..., None]
+    col = col * (1 - inside)
+    # centre dot: dark disc with a light ring
+    r = np.sqrt((u * 1.0) ** 2 + ((v - P["dot_y"]) * aspect) ** 2)
+    ring = np.exp(-((r - P["dot_r"]) / (0.35 * P["dot_r"] + 1e-6)) ** 2)[..., None]
+    disc = (1 - smooth(P["dot_r"] * 0.8, P["dot_r"], r))[..., None]
+    col = col * (1 - disc) + np.array([20.0, 20.0, 20.0]) * disc
+    col = col + ring * 160.0 * (P["dot_r"] > 0.004)
+    return np.clip(col, 0, 255)
+
+
+def grid(h: int, w: int):
+    u = np.linspace(-1, 1, w)[None, :].repeat(h, 0)
+    v = np.linspace(0, 1, h)[:, None].repeat(w, 1)
+    return u, v
+
+
+def pack(P):
+    return np.array([P[n] for n in NAMES] + [c for k in COLOURS for c in P[k]], float)
+
+
+def unpack(x):
+    P = {n: float(x[i]) for i, n in enumerate(NAMES)}
+    o = len(NAMES)
+    for j, k in enumerate(COLOURS):
+        P[k] = [float(c) for c in x[o + 3 * j:o + 3 * j + 3]]
+    return P
+
+
+DEFAULT = {"apex": 0.55, "k": 0.45, "p": 1.6, "soft": 0.01, "w_rim": 0.04, "w_core": 0.12, "w_out": 0.25,
+           "dot_y": 0.45, "dot_r": 0.02, "c_rim": [30, 60, 200], "c_rim_side": [230, 120, 20],
+           "c_core": [240, 240, 235], "c_core_side": [240, 200, 140], "c_out": [40, 60, 160], "c_top": [0, 0, 0]}
+LO = {"apex": 0.05, "k": 0.0, "p": 0.6, "soft": 0.001, "w_rim": 0.002, "w_core": 0.005, "w_out": 0.01, "dot_y": 0.0, "dot_r": 0.0}
+HI = {"apex": 0.98, "k": 2.0, "p": 4.0, "soft": 0.08, "w_rim": 0.3, "w_core": 0.6, "w_out": 1.2, "dot_y": 1.0, "dot_r": 0.08}
+
+
+def fit(img: np.ndarray, aspect: float, start: dict | None = None) -> tuple[dict, float]:
+    """img: screen crop, HxWx3 RGB (text already removed). Returns parameters and the RMS error (0-255)."""
+    h, w = img.shape[:2]
+    u, v = grid(h, w)
+    target = img.astype(float)
+    x0 = pack(start or DEFAULT)
+    lo = np.array([LO[n] for n in NAMES] + [0.0] * 3 * len(COLOURS))
+    hi = np.array([HI[n] for n in NAMES] + [255.0] * 3 * len(COLOURS))
+    x0 = np.clip(x0, lo + 1e-6, hi - 1e-6)
+    res = least_squares(lambda x: (field(unpack(x), u, v, aspect) - target).ravel() / 255.0, x0,
+                        bounds=(lo, hi), max_nfev=400, x_scale="jac")
+    P = unpack(res.x)
+    rms = float(np.sqrt(np.mean((field(P, u, v, aspect) - target) ** 2)))
+    return P, rms
